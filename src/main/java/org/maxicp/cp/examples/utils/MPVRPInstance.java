@@ -22,6 +22,7 @@ public class MPVRPInstance {
 
     public sealed interface MPVRPNode permits StationNode, GarageNode, DepotNode {
         int id();
+        int globalId(); // For the distanceMatrix Mapping
         double x();
         double y();
         int type(); // 0=station, 1=garage, 2=depot
@@ -34,15 +35,15 @@ public class MPVRPInstance {
         }
     }
 
-    public record StationNode(int id, double x, double y, double[] demand) implements MPVRPNode {
+    public record StationNode(int id, int globalId, double x, double y, double[] demand) implements MPVRPNode {
         @Override public int type() { return 0; }
     }
 
-    public record GarageNode(int id, double x, double y) implements MPVRPNode {
+    public record GarageNode(int id, int globalId, double x, double y) implements MPVRPNode {
         @Override public int type() { return 1; }
     }
 
-    public record DepotNode(int id, double x, double y, double[] stocks) implements MPVRPNode {
+    public record DepotNode(int id, int globalId, double x, double y, double[] stocks) implements MPVRPNode {
         @Override public int type() { return 2; }
     }
 
@@ -72,6 +73,7 @@ public class MPVRPInstance {
             inst.vehicules[i] = new Vehicule(id, capacity, null, initProd);
         }
 
+        int currentGlobalId = 0;
         // Get the depots
         inst.depots = new DepotNode[inst.nDepots];
         for (int i = 0; i < inst.nDepots; i++) {
@@ -82,13 +84,13 @@ public class MPVRPInstance {
             for (int p = 0; p < inst.nProds; p++) {
                 stocks[p] = reader.getDouble();
             }
-            inst.depots[i] = new DepotNode(id, x, y, stocks);
+            inst.depots[i] = new DepotNode(id, currentGlobalId++, x, y, stocks);
         }
 
         // Get the garages
         inst.garages = new GarageNode[inst.nGarages];
         for (int i = 0; i < inst.nGarages; i++) {
-            inst.garages[i] = new GarageNode(reader.getInt(), reader.getDouble(), reader.getDouble());
+            inst.garages[i] = new GarageNode(reader.getInt(), currentGlobalId++, reader.getDouble(), reader.getDouble());
         }
 
         // Get the stations
@@ -101,7 +103,7 @@ public class MPVRPInstance {
             for (int p = 0; p < inst.nProds; p++) {
                 demand[p] = reader.getDouble();
             }
-            inst.stations[i] = new StationNode(id, x, y, demand);
+            inst.stations[i] = new StationNode(id, currentGlobalId++, x, y, demand);
         }
 
         // post treatment
@@ -139,14 +141,12 @@ public class MPVRPInstance {
     }
 
     public void display() {
-        System.out.println("========================================");
-        System.out.println("  VERIFICATION DE L'INSTANCE MPVRP");
-        System.out.println("========================================");
-        System.out.println("UUID : " + uuid);
-        System.out.printf("Dimensions : %d Prods, %d Depots, %d Garages, %d Stations, %d Vehicules%n",
+        System.out.println("UUID: " + uuid);
+
+        // Correction des paramètres globaux
+        System.out.printf("Prods:%d Depots:%d Garages:%d Stations:%d Vehicules:%d%n",
                 nProds, nDepots, nGarages, nStations, nVehicules);
 
-        System.out.println("\n--- MATRICE DE TRANSITION (COUTS) ---");
         for (int i = 0; i < nProds; i++) {
             for (int j = 0; j < nProds; j++) {
                 System.out.print(changeoverCost[i][j] + "\t");
@@ -154,42 +154,26 @@ public class MPVRPInstance {
             System.out.println();
         }
 
-        System.out.println("\n--- FLOTTE DE VEHICULES ---");
         for (Vehicule v : vehicules) {
-            System.out.printf("ID: %d | Capacité: %f | Garage: %d (at x:%.1f, y:%.1f) | Prod Initial: %d%n",
-                    v.id(), v.capacity(), v.startG().id(), v.startG().x(), v.startG().y(), v.initProd());
+            System.out.printf("ID:%d | Cap:%s | GarageID:%d | InitProd:%d%n",
+                    v.id(), v.capacity(), v.startG().id(), v.initProd());
         }
 
-        System.out.println("\n--- DEPOTS ---");
         for (DepotNode d : depots) {
-            System.out.printf("ID: %d (x:%.1f, y:%.1f) | Stocks: ", d.id(), d.x(), d.y());
+            System.out.printf("ID:%d | X:%.1f Y:%.1f | Stocks: ", d.id(), d.x(), d.y());
             for (double s : d.stocks()) System.out.print(s + " ");
             System.out.println();
         }
 
-        System.out.println("\n--- GARAGES ---");
         for (GarageNode g : garages) {
-            System.out.printf("ID: %d (x:%.1f, y:%.1f)%n", g.id(), g.x(), g.y());
+            System.out.printf("ID:%d | X:%.1f Y:%.1f%n", g.id(), g.x(), g.y());
         }
 
-        System.out.println("\n--- STATIONS (CLIENTS) ---");
         for (StationNode s : stations) {
-            System.out.printf("ID: %d (x:%.1f, y:%.1f) | Demandes: ", s.id(), s.x(), s.y());
+            System.out.printf("ID:%d | X:%.1f Y:%.1f | Requests: ", s.id(), s.x(), s.y());
             for (double d : s.demand()) System.out.print(d + " ");
             System.out.println();
         }
-
-        if (distMatrix != null) {
-            System.out.println("\n--- MATRICE DE DISTANCE ---");
-            int limit = distMatrix.length;
-            for (int i = 0; i < limit; i++) {
-                for (int j = 0; j < limit; j++) {
-                    System.out.printf("%.2f\t", distMatrix[i][j]);
-                }
-                System.out.println();
-            }
-        }
-        System.out.println("========================================\n");
     }
 
     public static void main(String[] args) {
