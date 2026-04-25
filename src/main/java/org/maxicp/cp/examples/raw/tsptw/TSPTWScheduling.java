@@ -1,0 +1,108 @@
+/*
+ * MaxiCP is under MIT License
+ * Copyright (c)  2024 UCLouvain
+ *
+ */
+
+package org.maxicp.cp.examples.raw.tsptw;
+
+import org.maxicp.cp.CPFactory;
+import org.maxicp.cp.engine.constraints.*;
+import org.maxicp.cp.engine.constraints.scheduling.NoOverlapBinaryWithTransitionTime;
+import org.maxicp.cp.engine.core.*;
+import org.maxicp.cp.examples.utils.TSPTWInstance;
+import org.maxicp.modeling.IntVar;
+import org.maxicp.search.*;
+import org.maxicp.util.algo.DistanceMatrix;
+import org.maxicp.util.io.InputReader;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+
+import static org.maxicp.cp.CPFactory.*;
+import static org.maxicp.search.Searches.*;
+
+public class TSPTWScheduling {
+
+    public static void main(String[] args) {
+
+        TSPTWInstance instance = new TSPTWInstance("data/TSPTW/Dumas/n40w20.001.txt");
+
+        CPSolver cp = makeSolver();
+
+        // create visits as interval variables of length 0 with time windows
+        CPIntervalVar [] visits = CPFactory.makeIntervalVarArray(cp, instance.n);
+        for (int i = 0; i < instance.n; i++) {
+            visits[i] = makeIntervalVar(cp, false, 0, 0); // 0 length interval
+            visits[i].setStartMin(instance.earliest[i]);
+            visits[i].setEndMax(instance.latest[i]);
+        }
+
+        // noOverlap with transition times
+        for (int i = 0; i < instance.n-1; i++) {
+            for (int j = i+1; j < instance.n; j++) {
+                cp.post(new NoOverlapBinaryWithTransitionTime(visits[i], visits[j], instance.distMatrix[i][j], instance.distMatrix[j][i]));
+            }
+        }
+
+        // positionOfNode[i] is the position of node i in the tour
+        CPIntVar [] positionOfNode = CPFactory.makeIntVarArray(cp, instance.n, instance.n);
+        // taskInPosition[i] is the node at position i in the tour
+        CPIntVar [] taskInPosition = CPFactory.makeIntVarArray(cp, instance.n, instance.n);
+
+        // channeling between positionOfNode and taskInPosition positionOfNode[i] = p <=> taskInPosition[p] = i
+        cp.post(new InversePerm(positionOfNode, taskInPosition));
+        // no overlap between visits
+        cp.post(noOverlap(visits));
+
+        // enforce the transition time constraints
+        ArrayList<IntVar> precedences = new ArrayList<>();
+        for (int i = 0; i < instance.n; i++) {
+            for (int j = i+1; j < instance.n; j++) {
+                // order = 1 <=> positionOfNode[i] < positionOfNode[j]
+                // order = 0 <=> positionOfNode[j] < positionOfNode[i]
+                CPBoolVar order = CPFactory.strictOrder(positionOfNode[i], positionOfNode[j]);
+                // if order = 1 then visits[i] before visits[j] with transition time instance.distMatrix[i][j]
+                // if order = 0 then visits[j] before visits[i] with transition time instance
+                cp.post(new NoOverlapBinaryWithTransitionTime(order, visits[i], visits[j], instance.distMatrix[i][j], instance.distMatrix[j][i]));
+                precedences.add(order);
+            }
+        }
+
+        cp.post(eq(positionOfNode[0],0)); // start at depot
+        cp.post(startAt(visits[0],0 )); // at time 0
+        cp.post(eq(positionOfNode[instance.n-1],instance.n-1)); // end at depot duplicate
+
+        // transition times and objective
+        CPIntVar totTransition = makeIntVar(cp, 0 , instance.horizon);
+        CPIntVar[] transitionTimes = makeIntVarArray(cp, instance.n-1, 0, instance.horizon);
+        for (int i = 0; i < instance.n-1; i++) {
+            cp.post(eq(transitionTimes[i],
+                    CPFactory.element(instance.distMatrix, taskInPosition[i], taskInPosition[i+1])));
+        }
+        cp.post(sum(transitionTimes, totTransition));
+
+        Objective obj = cp.minimize(totTransition);
+
+        // ===================== search =====================
+
+        // choose the nodes in the order of the tour, trying first the nodes with the least positions
+        DFSearch dfs = makeDfs(cp,heuristicNary(staticOrderVariableSelector(taskInPosition),
+                i -> positionOfNode[i].size()));
+
+        dfs.onSolution(() -> {;
+            System.out.println("total distance: " + totTransition);
+            // check solution
+            int[] tour = Arrays.stream(taskInPosition).mapToInt(t -> t.min()).toArray();
+            boolean ok = instance.checkSolution(tour, totTransition.min());
+            assert(ok);
+        });
+
+        SearchStatistics stats = dfs.optimize(obj);
+
+        System.out.println(stats);
+
+    }
+
+}
+
