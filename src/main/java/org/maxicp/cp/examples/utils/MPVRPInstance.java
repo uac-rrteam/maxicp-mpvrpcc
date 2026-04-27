@@ -143,7 +143,6 @@ public class MPVRPInstance {
     public void display() {
         System.out.println("UUID: " + uuid);
 
-        // Correction des paramètres globaux
         System.out.printf("Prods:%d Depots:%d Garages:%d Stations:%d Vehicules:%d%n",
                 nProds, nDepots, nGarages, nStations, nVehicules);
 
