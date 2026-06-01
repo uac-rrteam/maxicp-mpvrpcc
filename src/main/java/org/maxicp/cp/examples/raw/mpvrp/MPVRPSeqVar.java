@@ -11,15 +11,19 @@ import org.maxicp.search.DFSearch;
 import org.maxicp.search.Objective;
 import org.maxicp.search.SearchStatistics;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.function.Supplier;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.stream.IntStream;
 
 import static org.maxicp.cp.CPFactory.*;
 import static org.maxicp.modeling.algebra.sequence.SeqStatus.INSERTABLE;
-import static org.maxicp.modeling.algebra.sequence.SeqStatus.MEMBER;
+import static org.maxicp.modeling.algebra.sequence.SeqStatus.MEMBER_ORDERED;
 import static org.maxicp.search.Searches.*;
 
 public class MPVRPSeqVar {
@@ -29,11 +33,22 @@ public class MPVRPSeqVar {
     private static final int NODE_DROP = 1;   // station visit
     private static final int NODE_GARAGE = 2;
 
-    private record Request(int station, int stationGlobal, int depotGlobal, int product, int quantity) {
+    private record Request(int station, int stationGlobal, int depotGlobal, int product, int quantity, double rawQuantity) {
+    }
+
+    private record RouteSolution(String visitLine, String productLine, int productChanges, double transitionCost,
+                                 double distance) {
+    }
+
+    private record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges,
+                                double transitionCost, double distance) {
     }
 
     public static void main(String[] args) throws Exception {
-        MPVRPInstance inst = MPVRPInstance.read("data/MPVRPCC/one.dat");
+        String inputFile = args.length > 0 ? args[0] : "data/MPVRPCC/one.dat";
+        String outputFile = args.length > 1 ? args[1] : null;
+
+        MPVRPInstance inst = MPVRPInstance.read(inputFile);
         CPSolver cp = makeSolver();
 
         // ===================== data =====================
@@ -221,20 +236,26 @@ public class MPVRPSeqVar {
 
         DFSearch search = makeDfs(cp, branching);
         Objective objective = cp.minimize(sumDistance);
+        final SolutionData[] bestSolution = new SolutionData[1];
+        final int[] bestObjective = {Integer.MAX_VALUE};
+        long init = System.currentTimeMillis();
 
         search.onSolution(() -> {
-            System.out.printf("distance = %.2f%n", sumDistance.min() / (double) SCALE);
-            for (int v = 0; v < V; v++) {
-                CPSeqVar r = route[v];
-                if (r.nNode(MEMBER) > 2) {
-                    String path = r.membersOrdered(" -> ", n -> n != r.start() && n != r.end());
-                    System.out.printf("v%d | prod=%d | load=%d | %s%n", v, prodV[v].min(), loadV[v].min(), path);
-                }
+            int objectiveValue = sumDistance.min();
+            if (objectiveValue < bestObjective[0]) {
+                bestObjective[0] = objectiveValue;
+                bestSolution[0] = captureSolution(inst, requests, route, initProd, nNodes, R);
             }
-            System.out.println("-----------------");
         });
 
         SearchStatistics stats = search.optimize(objective);
+        long elapsedMs = System.currentTimeMillis() - init;
+        if (bestSolution[0] != null) {
+            String text = buildSolutionText(bestSolution[0], elapsedMs / 1000.0);
+            Path out = Path.of(outputFile != null ? outputFile : defaultOutputPath(inst));
+            writeSolution(out, text);
+            System.out.println("solution written to " + out.toAbsolutePath());
+        }
         System.out.println(stats);
     }
 
@@ -299,10 +320,198 @@ public class MPVRPSeqVar {
                     throw new IllegalArgumentException("No depot can supply station " + s + " for product " + p);
                 }
                 stock[bestDepot][p] -= qty;
-                requests.add(new Request(s, stationGlobal, inst.depots[bestDepot].globalId(), p, qty));
+                requests.add(new Request(s, stationGlobal, inst.depots[bestDepot].globalId(), p, qty, inst.stations[s].demand()[p]));
             }
         }
         return requests;
+    }
+
+    private static SolutionData captureSolution(MPVRPInstance inst, List<Request> requests, CPSeqVar[] route,
+                                                int[] initProd, int nNodes, int nRequest) {
+        int[] nodes = new int[nNodes];
+        List<RouteSolution> routes = new ArrayList<>();
+        int usedVehicles = 0;
+        int totalProductChanges = 0;
+        double totalTransitionCost = 0.0;
+        double totalDistance = 0.0;
+
+        for (int v = 0; v < route.length; v++) {
+            int nMember = route[v].fillNode(nodes, MEMBER_ORDERED);
+            if (nMember <= 2) {
+                continue;
+            }
+
+            usedVehicles++;
+            List<String> visitParts = new ArrayList<>();
+            List<String> productParts = new ArrayList<>();
+
+            int currentProduct = initProd[v];
+            double cumulativeChangeCost = 0.0;
+            int productChanges = 0;
+            double routeDistance = 0.0;
+
+            for (int i = 0; i < nMember; i++) {
+                int node = nodes[i];
+                int globalId = globalIdOf(node, inst, requests, v, nRequest);
+
+                if (i > 0) {
+                    int prev = nodes[i - 1];
+                    int prevGlobalId = globalIdOf(prev, inst, requests, v, nRequest);
+                    routeDistance += inst.distMatrix[prevGlobalId][globalId];
+                }
+
+                if (node < nRequest) {
+                    Request req = requests.get(node);
+                    if (req.product() != currentProduct) {
+                        cumulativeChangeCost += inst.changeoverCost[currentProduct][req.product()];
+                        currentProduct = req.product();
+                        productChanges++;
+                    }
+                    visitParts.add(formatDepotLabel(inst, req.depotGlobal(), req.rawQuantity()));
+                    productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
+                } else if (node < 2 * nRequest) {
+                    Request req = requests.get(node - nRequest);
+                    visitParts.add(formatStationLabel(inst, req.stationGlobal(), req.rawQuantity()));
+                    productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
+                } else {
+                    visitParts.add(formatGarageLabel(inst, globalId));
+                    productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
+                }
+            }
+
+            totalProductChanges += productChanges;
+            totalTransitionCost += cumulativeChangeCost;
+            totalDistance += routeDistance;
+
+            routes.add(new RouteSolution(
+                    (v + 1) + ": " + String.join(" - ", visitParts),
+                    (v + 1) + ": " + String.join(" - ", productParts),
+                    productChanges,
+                    cumulativeChangeCost,
+                    routeDistance));
+        }
+
+        return new SolutionData(routes, usedVehicles, totalProductChanges, totalTransitionCost, totalDistance);
+    }
+
+    private static String buildSolutionText(SolutionData solution, double elapsedSeconds) {
+        StringBuilder sb = new StringBuilder();
+        for (RouteSolution route : solution.routes()) {
+            sb.append(route.visitLine()).append('\n');
+            sb.append(route.productLine()).append('\n').append('\n');
+        }
+        sb.append(solution.usedVehicles()).append('\n');
+        sb.append(solution.productChanges()).append('\n');
+        sb.append(formatCost(solution.transitionCost())).append('\n');
+        sb.append(formatDistance(solution.distance())).append('\n');
+        sb.append(readProcessorModel()).append('\n');
+        sb.append(String.format(Locale.US, "%.3f", elapsedSeconds)).append('\n');
+        return sb.toString();
+    }
+
+    private static void writeSolution(Path file, String text) throws IOException {
+        Path parent = file.toAbsolutePath().getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Files.writeString(file, text);
+    }
+
+    private static String defaultOutputPath(MPVRPInstance inst) {
+        return "Sol_MPVRP_" + sanitize(inst.uuid) + ".dat";
+    }
+
+    private static String sanitize(String s) {
+        return s.replaceAll("[^a-zA-Z0-9._-]+", "_");
+    }
+
+    private static String formatGarageLabel(MPVRPInstance inst, int globalId) {
+        return Integer.toString(garageByGlobal(inst, globalId).id());
+    }
+
+    private static String formatDepotLabel(MPVRPInstance inst, int globalId, double qty) {
+        return depotByGlobal(inst, globalId).id() + " [" + formatQuantity(qty) + "]";
+    }
+
+    private static String formatStationLabel(MPVRPInstance inst, int globalId, double qty) {
+        return stationByGlobal(inst, globalId).id() + " (" + formatQuantity(qty) + ")";
+    }
+
+    private static String formatProductLabel(int product, double cumulativeCost) {
+        return product + "(" + formatCost(cumulativeCost) + ")";
+    }
+
+    private static String formatQuantity(double value) {
+        return formatNumber(value);
+    }
+
+    private static String formatCost(double value) {
+        return String.format(Locale.US, "%.2f", value);
+    }
+
+    private static String formatDistance(double value) {
+        return String.format(Locale.US, "%.2f", value);
+    }
+
+    private static String formatNumber(double value) {
+        double rounded = Math.rint(value);
+        if (Math.abs(value - rounded) < 1e-9) {
+            return Long.toString(Math.round(rounded));
+        }
+        return String.format(Locale.US, "%.2f", value);
+    }
+
+    private static String readProcessorModel() {
+        try {
+            List<String> lines = Files.readAllLines(Path.of("/proc/cpuinfo"));
+            for (String line : lines) {
+                if (line.startsWith("model name")) {
+                    int idx = line.indexOf(':');
+                    if (idx >= 0) {
+                        return line.substring(idx + 1).trim();
+                    }
+                }
+            }
+        } catch (IOException ignored) {
+        }
+        return System.getProperty("os.name") + " " + System.getProperty("os.arch");
+    }
+
+    private static MPVRPInstance.GarageNode garageByGlobal(MPVRPInstance inst, int globalId) {
+        for (MPVRPInstance.GarageNode g : inst.garages) {
+            if (g.globalId() == globalId) {
+                return g;
+            }
+        }
+        throw new IllegalArgumentException("Unknown garage global id: " + globalId);
+    }
+
+    private static MPVRPInstance.DepotNode depotByGlobal(MPVRPInstance inst, int globalId) {
+        for (MPVRPInstance.DepotNode d : inst.depots) {
+            if (d.globalId() == globalId) {
+                return d;
+            }
+        }
+        throw new IllegalArgumentException("Unknown depot global id: " + globalId);
+    }
+
+    private static MPVRPInstance.StationNode stationByGlobal(MPVRPInstance inst, int globalId) {
+        for (MPVRPInstance.StationNode s : inst.stations) {
+            if (s.globalId() == globalId) {
+                return s;
+            }
+        }
+        throw new IllegalArgumentException("Unknown station global id: " + globalId);
+    }
+
+    private static int globalIdOf(int node, MPVRPInstance inst, List<Request> requests, int vehicle, int nRequest) {
+        if (node < nRequest) {
+            return requests.get(node).depotGlobal();
+        }
+        if (node < 2 * nRequest) {
+            return requests.get(node - nRequest).stationGlobal();
+        }
+        return inst.vehicules[vehicle].startG().globalId();
     }
 
     private static int[][] buildArcCosts(MPVRPInstance inst,
