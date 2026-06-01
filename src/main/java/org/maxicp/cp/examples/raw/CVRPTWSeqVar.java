@@ -46,13 +46,16 @@ public class CVRPTWSeqVar {
         CPIntVar[] distance = new CPIntVar[instance.nVehicle];
         CPIntVar sumDistance = makeIntVar(cp, 0, instance.nVehicle * instance.depot.twEnd);
         CPIntVar[] vehicleLoad = new CPIntVar[instance.nVehicle];
+
         int[] duration = new int[nNode];
         int[] load = new int[nNode];
+
         for (int i = 0; i < instance.nRequest; i++) {
             time[i] = makeIntVar(cp, instance.requestNode[i].twStart, instance.requestNode[i].twEnd);
             duration[i] = instance.requestNode[i].duration;
             load[i] = instance.requestNode[i].demand;
         }
+
         for (int i = instance.nRequest; i < nNode; i++) {
             time[i] = makeIntVar(cp, instance.depot.twStart, instance.depot.twEnd);
             duration[i] = instance.depot.duration;

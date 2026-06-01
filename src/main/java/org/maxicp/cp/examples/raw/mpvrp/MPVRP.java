@@ -66,6 +66,7 @@ public class MPVRP {
         CPIntVar[][] prod = new CPIntVar[V][N]; // product transported by vehicule v after visiting node n
         CPIntVar[][] load = new CPIntVar[V][N]; // load of vehicule v after visiting node n
         CPIntVar[][] rinse = new CPIntVar[V][N]; // total change-over cost of vehicule v after visiting node n
+        CPIntVar[][] distance = new CPIntVar[V][N]; // total distance of vehicule v after visiting node n
 
         for (int v = 0; v < V; v++) {
             for (int n = 0; n < N; n++) {
@@ -74,6 +75,7 @@ public class MPVRP {
                 prod[v][n] = makeIntVar(cp, 0, P - 1);
                 load[v][n] = makeIntVar(cp, 0, (int) cap[v]);
                 rinse[v][n] = makeIntVar(cp, 0, (int) Arrays.stream(changeCost).flatMapToDouble(Arrays::stream).max().orElse(0) * N);
+
             }
         }
 
@@ -88,18 +90,12 @@ public class MPVRP {
             // initial changeover cost of each car = 0
             cp.post(eq(rinse[v][0], 0));
             // final node of each car must be a garage (not necessarily the same as the departure garage)
-            // cp.post(new In(pred[v][N - 1], garageIds));
-            cp.post(among(succ[v], garageIds, 1));
-
-
 
             // the second node must be a depot
-
             for  (int n = 0; n < N; n++) {
                 // link pred and succ nodes
                 cp.post(new InversePerm(succ[v], pred[v]));
             }
-
         }
     }
 }
