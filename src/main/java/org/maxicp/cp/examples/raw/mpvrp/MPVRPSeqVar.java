@@ -36,12 +36,10 @@ public class MPVRPSeqVar {
     private record Request(int station, int stationGlobal, int depotGlobal, int product, int quantity, double rawQuantity) {
     }
 
-    private record RouteSolution(String visitLine, String productLine, int productChanges, double transitionCost,
-                                 double distance) {
+    private record RouteSolution(String visitLine, String productLine, int productChanges, double transitionCost, double distance) {
     }
 
-    private record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges,
-                                double transitionCost, double distance) {
+    private record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges, double transitionCost, double distance) {
     }
 
     public static void main(String[] args) throws Exception {
