@@ -11,6 +11,7 @@ public class MPVRPInstance {
 
     public String uuid;
     public int nProds, nDepotsRead, nDepotProducts, nGarages, nStationsRead, nRequests, nVehicules;
+    public int nDepots, nStations;
     public double[][] changeoverCost;
 
     public Vehicule[] vehicules;
@@ -18,9 +19,15 @@ public class MPVRPInstance {
     public DepotProductNode[] depotProducts;
     public GarageNode[] garages;
 
+    public Depot[] depots;
+    public Station[] stations;
+
     public double[][] distMatrix;
 
     public record Vehicule(int id, double capacity, GarageNode startG, int initProd) {}
+
+    public record Depot(int id, double x, double y, double[] stocks) {}
+    public record Station(int id, double x, double y, double[] demand) {}
 
     public sealed interface MPVRPNode permits RequestNode, GarageNode, DepotProductNode {
         int id();
@@ -49,11 +56,14 @@ public class MPVRPInstance {
     }
 
     public static MPVRPInstance read(String filename) throws IOException {
+        return read(filename, 10); // Default 3 copies per depot-product node to allow multiple visits
+    }
+
+    public static MPVRPInstance read(String filename, int depotCopies) throws IOException {
         MPVRPInstance inst = new MPVRPInstance();
         InputReader reader = new InputReader(filename);
 
-        // inst.uuid = reader.getString().replace("#", "");
-        reader.getString();
+        reader.getString(); // "#"
         inst.uuid = reader.getString();
 
         inst.nProds = reader.getInt();
@@ -61,10 +71,12 @@ public class MPVRPInstance {
         inst.nGarages = reader.getInt();
         inst.nStationsRead = reader.getInt();
         inst.nVehicules = reader.getInt();
+        inst.nDepots = inst.nDepotsRead;
+        inst.nStations = inst.nStationsRead;
 
         inst.changeoverCost = reader.getDoubleMatrix(inst.nProds, inst.nProds);
 
-        // vehicules fleet
+        // vehicles fleet
         int[] homeGarageIds = new int[inst.nVehicules];
         inst.vehicules = new Vehicule[inst.nVehicules];
 
@@ -72,49 +84,59 @@ public class MPVRPInstance {
             int id = reader.getInt();
             double capacity = reader.getDouble();
             homeGarageIds[i] = reader.getInt();
-            int initProd = reader.getInt();
+            int initProd = reader.getInt() - 1; // Normalize to 0-indexed (0..nProds-1)
             inst.vehicules[i] = new Vehicule(id, capacity, null, initProd);
         }
 
         int currentGlobalId = 0;
 
-        // Depot-product nodes
+        // Depot-product nodes (with copies for multiple visit capability)
+        inst.depots = new Depot[inst.nDepotsRead];
         List<DepotProductNode> depotList = new ArrayList<>();
         for (int i = 0; i < inst.nDepotsRead; i++) {
             int id = reader.getInt();
             double x = reader.getDouble();
             double y = reader.getDouble();
+            double[] stocks = new double[inst.nProds];
 
             for (int p = 0; p < inst.nProds; p++) {
                 double stock = reader.getDouble();
+                stocks[p] = stock;
                 if (stock > 0) {
-                    depotList.add(new  DepotProductNode(id, currentGlobalId++, x, y, p, stock));
+                    for (int c = 0; c < depotCopies; c++) {
+                        depotList.add(new DepotProductNode(id, currentGlobalId++, x, y, p, stock));
+                    }
                 }
             }
+            inst.depots[i] = new Depot(id, x, y, stocks);
         }
 
         inst.depotProducts = depotList.toArray(new DepotProductNode[0]);
-        inst.nDepotProducts =  inst.depotProducts.length;
+        inst.nDepotProducts = inst.depotProducts.length;
 
-        // Garages = nodes where vehicules start and end their routes
+        // Garages
         inst.garages = new GarageNode[inst.nGarages];
         for (int i = 0; i < inst.nGarages; i++) {
             inst.garages[i] = new GarageNode(reader.getInt(), currentGlobalId++, reader.getDouble(), reader.getDouble());
         }
 
-        // Requests
+        // Requests / Stations
+        inst.stations = new Station[inst.nStationsRead];
         List<RequestNode> requestList = new ArrayList<>();
         for (int i = 0; i < inst.nStationsRead; i++) {
             int id = reader.getInt();
             double x = reader.getDouble();
             double y = reader.getDouble();
+            double[] demands = new double[inst.nProds];
 
             for (int p = 0; p < inst.nProds; p++) {
                 double demand = reader.getDouble();
+                demands[p] = demand;
                 if (demand > 0) {
-                    requestList.add(new  RequestNode(id, currentGlobalId++, x, y, p, demand));
+                    requestList.add(new RequestNode(id, currentGlobalId++, x, y, p, demand));
                 }
             }
+            inst.stations[i] = new Station(id, x, y, demands);
         }
 
         inst.requests = requestList.toArray(new RequestNode[0]);
