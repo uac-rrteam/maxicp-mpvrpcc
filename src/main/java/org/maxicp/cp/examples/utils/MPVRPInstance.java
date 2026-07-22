@@ -7,34 +7,64 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+/**
+ * Data parser and container for the Multi-Product Vehicle Routing Problem
+ * with Changeover Costs (MPVRP-CC).
+ *
+ * <p>Reads instances from benchmark .dat files and builds node graphs.</p>
+ *
+ * @author Rosas Behoundja
+ */
 public class MPVRPInstance {
 
+    // =========================================================================
+    // Instance Metadata & Dimensions
+    // =========================================================================
     public String uuid;
-    public int nProds, nDepotsRead, nDepotProducts, nGarages, nStationsRead, nRequests, nVehicules;
-    public int nDepots, nStations;
+    public int nProds;           // Number of product types
+    public int nDepotsRead;      // Number of physical depots in instance file
+    public int nDepots;          // Number of physical depots
+    public int nDepotProducts;  // Total depot-product nodes in graph (including copies)
+    public int nGarages;        // Number of garages
+    public int nStationsRead;   // Number of physical stations in instance file
+    public int nStations;       // Number of physical stations
+    public int nRequests;       // Total positive station demand requests
+    public int nVehicules;      // Number of available vehicles
+
+    /** Changeover cost matrix: changeoverCost[p1][p2] = cost of cleaning tank from product p1 to p2 */
     public double[][] changeoverCost;
 
+    // Entity collections
     public Vehicule[] vehicules;
     public RequestNode[] requests;
     public DepotProductNode[] depotProducts;
     public GarageNode[] garages;
-
     public Depot[] depots;
     public Station[] stations;
 
+    /** Global pairwise distance matrix across all graph nodes */
     public double[][] distMatrix;
 
+    // =========================================================================
+    // Data Record Definitions
+    // =========================================================================
+
+    /** Represents a vehicle with capacity, initial home garage, and starting product. */
     public record Vehicule(int id, double capacity, GarageNode startG, int initProd) {}
 
+    /** Represents a physical depot with stocks for all products. */
     public record Depot(int id, double x, double y, double[] stocks) {}
+
+    /** Represents a physical station with product demands. */
     public record Station(int id, double x, double y, double[] demand) {}
 
+    /** Base interface for nodes in the execution graph. */
     public sealed interface MPVRPNode permits RequestNode, GarageNode, DepotProductNode {
-        int id();
-        int globalId(); // for the distance matrix mapping
+        int id();         // 1-based entity ID from instance file
+        int globalId();   // 0-based unique index in the distance matrix
         double x();
         double y();
-        int type(); // 0=request, 1=garage, 2=depot-product
+        int type();       // 0 = Request, 1 = Garage, 2 = Depot-Product
 
         default double distance(MPVRPNode o) {
             double dx = this.x() - o.x();
@@ -43,29 +73,49 @@ public class MPVRPInstance {
         }
     }
 
+    /** Garage node representing vehicle departure and arrival location. */
     public record GarageNode(int id, int globalId, double x, double y) implements MPVRPNode {
-        @Override public int type() { return 1;}
+        @Override public int type() { return 1; }
     }
 
+    /** Request node representing a specific station's demand for a single product. */
     public record RequestNode(int id, int globalId, double x, double y, int product, double demand) implements MPVRPNode {
-        @Override public int type() { return 0;}
+        @Override public int type() { return 0; }
     }
 
+    /** Depot-product node representing loading capability for a specific product at a depot. */
     public record DepotProductNode(int id, int globalId, double x, double y, int product, double stock) implements MPVRPNode {
-        @Override public int type() { return 2;}
+        @Override public int type() { return 2; }
     }
 
+    // =========================================================================
+    // Factory Reader Methods
+    // =========================================================================
+
+    /**
+     * Reads an MPVRP-CC instance file with default 3 node copies per depot-product pair
+     * to support multiple visits per depot.
+     */
     public static MPVRPInstance read(String filename) throws IOException {
-        return read(filename, 10); // Default 3 copies per depot-product node to allow multiple visits
+        return read(filename, 3);
     }
 
+    /**
+     * Reads an MPVRP-CC instance file.
+     *
+     * @param filename Path to the .dat instance file.
+     * @param depotCopies Number of node copies per depot-product pair to allow multiple mini-route visits.
+     * @return Parsed MPVRPInstance object.
+     */
     public static MPVRPInstance read(String filename, int depotCopies) throws IOException {
         MPVRPInstance inst = new MPVRPInstance();
         InputReader reader = new InputReader(filename);
 
+        // Header: UUID line
         reader.getString(); // "#"
         inst.uuid = reader.getString();
 
+        // Instance dimensions
         inst.nProds = reader.getInt();
         inst.nDepotsRead = reader.getInt();
         inst.nGarages = reader.getInt();
@@ -74,9 +124,10 @@ public class MPVRPInstance {
         inst.nDepots = inst.nDepotsRead;
         inst.nStations = inst.nStationsRead;
 
+        // Changeover cost matrix (nProds x nProds)
         inst.changeoverCost = reader.getDoubleMatrix(inst.nProds, inst.nProds);
 
-        // vehicles fleet
+        // Vehicle fleet initialization
         int[] homeGarageIds = new int[inst.nVehicules];
         inst.vehicules = new Vehicule[inst.nVehicules];
 
@@ -84,13 +135,13 @@ public class MPVRPInstance {
             int id = reader.getInt();
             double capacity = reader.getDouble();
             homeGarageIds[i] = reader.getInt();
-            int initProd = reader.getInt() - 1; // Normalize to 0-indexed (0..nProds-1)
+            int initProd = reader.getInt() - 1; // Normalize to 0-based index [0..nProds-1]
             inst.vehicules[i] = new Vehicule(id, capacity, null, initProd);
         }
 
         int currentGlobalId = 0;
 
-        // Depot-product nodes (with copies for multiple visit capability)
+        // Physical Depots and Depot-Product Nodes (with copies)
         inst.depots = new Depot[inst.nDepotsRead];
         List<DepotProductNode> depotList = new ArrayList<>();
         for (int i = 0; i < inst.nDepotsRead; i++) {
@@ -120,7 +171,7 @@ public class MPVRPInstance {
             inst.garages[i] = new GarageNode(reader.getInt(), currentGlobalId++, reader.getDouble(), reader.getDouble());
         }
 
-        // Requests / Stations
+        // Physical Stations and Station Request Nodes
         inst.stations = new Station[inst.nStationsRead];
         List<RequestNode> requestList = new ArrayList<>();
         for (int i = 0; i < inst.nStationsRead; i++) {
@@ -142,7 +193,7 @@ public class MPVRPInstance {
         inst.requests = requestList.toArray(new RequestNode[0]);
         inst.nRequests = inst.requests.length;
 
-        // Post-processing
+        // Link vehicles to home garage nodes and compute pairwise distances
         inst.linkVehicles(homeGarageIds);
         inst.buildDistanceMatrix();
 
@@ -163,7 +214,6 @@ public class MPVRPInstance {
 
     private void buildDistanceMatrix() {
         List<MPVRPNode> allNodes = new ArrayList<>();
-
         allNodes.addAll(Arrays.asList(depotProducts));
         allNodes.addAll(Arrays.asList(garages));
         allNodes.addAll(Arrays.asList(requests));
@@ -178,52 +228,10 @@ public class MPVRPInstance {
         }
     }
 
+    /** Display summary of instance metrics. */
     public void display() {
         System.out.println("UUID: " + uuid);
-
         System.out.printf("Prods:%d DepotLines:%d DepotProducts:%d Garages:%d Stations:%d Requests:%d Vehicules:%d%n",
                 nProds, nDepotsRead, nDepotProducts, nGarages, nStationsRead, nRequests, nVehicules);
-
-        System.out.println("\nChangeover Costs:");
-        for (int i = 0; i < nProds; i++) {
-            for (int j = 0; j < nProds; j++) {
-                System.out.print(changeoverCost[i][j] + "\t");
-            }
-            System.out.println();
-        }
-
-        System.out.println("\nVehicules:");
-        for (Vehicule v : vehicules) {
-            System.out.printf("ID:%d | Cap:%.1f | Garage:%d | InitProd:%d%n",
-                    v.id(), v.capacity(), v.startG().id(), v.initProd());
-        }
-
-        System.out.println("\nDepot Products:");
-        for (DepotProductNode d : depotProducts) {
-            System.out.printf("Depot:%d | GlobalID:%d | Product:%d | Stock:%.1f | X:%.1f Y:%.1f%n",
-                    d.id(), d.globalId(), d.product(), d.stock(), d.x(), d.y());
-        }
-
-        System.out.println("\nGarages:");
-        for (GarageNode g : garages) {
-            System.out.printf("ID:%d | GlobalID:%d | X:%.1f Y:%.1f%n",
-                    g.id(), g.globalId(), g.x(), g.y());
-        }
-
-        System.out.println("\nRequests:");
-        for (RequestNode r : requests) {
-            System.out.printf(
-                    "Station:%d | GlobalID:%d | Product:%d | Demand:%.1f | X:%.1f Y:%.1f%n",
-                    r.id(), r.globalId(), r.product(), r.demand(), r.x(), r.y());
-        }
-    }
-
-    public static void main(String[] args) {
-        try {
-            MPVRPInstance inst = MPVRPInstance.read("data/MPVRPCC/small/MPVRP_S_011_s8_d1_p2.dat");
-            inst.display();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
     }
 }

@@ -27,35 +27,38 @@ import static org.maxicp.modeling.algebra.sequence.SeqStatus.MEMBER_ORDERED;
 import static org.maxicp.search.Searches.*;
 
 /**
- * Multi-Product VRP with Changeover Costs using Sequence Variables (CPSeqVar)
+ * Multi-Product Vehicle Routing Problem with Changeover Cost
  *
  * @author Rosas Behoundja
  */
 public class MPVRPSeqVar {
 
+    // Node Kind Constants
+    private static final int NODE_PICKUP = 0; // Depot loading visit
+    private static final int NODE_DROP = 1;   // Station delivery visit
+    private static final int NODE_GARAGE = 2; // Garage start/end node
+
+    /** Scaling factor to convert floating-point values to integer CP domains. */
     private static final int SCALE = 100;
-    private static final int NODE_PICKUP = 0; // depot visit
-    private static final int NODE_DROP = 1;   // station visit
-    private static final int NODE_GARAGE = 2;
+
+    /** Large penalty for invalid node transitions. */
     private static final int PENALTY_INF = 1_000_000;
 
-    private record Request(int stationId, int stationGlobal, int depotId, int depotGlobal, int product, int quantity, double rawQuantity) {
-    }
-
-    private record RouteSolution(String visitLine, String productLine, int productChanges, double transitionCost, double distance) {
-    }
-
-    private record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges, double transitionCost, double distance) {
-    }
+    // Helper data structures for sequence solution export
+    private record Request(int stationId, int stationGlobal, int depotId, int depotGlobal, int product, int quantity, double rawQuantity) {}
+    private record RouteSolution(String visitLine, String productLine, int productChanges, double transitionCost, double distance) {}
+    private record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges, double transitionCost, double distance) {}
 
     public static void main(String[] args) throws Exception {
-        String inputFile = args.length > 0 ? args[0] : "data/MPVRPCC/inst/MPVRP_007_s36_d8_p2.dat";
+        String inputFile = args.length > 0 ? args[0] : "data/MPVRPCC/one.dat";
         String outputFile = args.length > 1 ? args[1] : null;
 
         MPVRPInstance inst = MPVRPInstance.read(inputFile);
         CPSolver cp = makeSolver();
 
-        // ===================== data =====================
+        // =========================================================================
+        // 1. Problem Data & Fleet Parameters
+        // =========================================================================
         int V = inst.nVehicules;
         int S = inst.nStations;
         int P = inst.nProds;
@@ -65,10 +68,11 @@ public class MPVRPSeqVar {
         int[] cap = new int[V];
         for (int v = 0; v < V; v++) {
             departure[v] = inst.vehicules[v].startG().globalId();
-            initProd[v] = inst.vehicules[v].initProd(); // Already 0-indexed from parser
+            initProd[v] = inst.vehicules[v].initProd(); // 0-indexed product ID
             cap[v] = (int) Math.round(inst.vehicules[v].capacity() * SCALE);
         }
 
+        // Build station requests supplied by feasible depots
         List<Request> requests = buildRequests(inst);
         int R = requests.size();
         if (R == 0) {
@@ -76,6 +80,7 @@ public class MPVRPSeqVar {
             return;
         }
 
+        // Total sequence nodes N = 2*R + 2*V (R pickups + R drops + V garage starts + V garage ends)
         int nNodes = 2 * R + 2 * V;
         int[] starts = new int[R];
         int[] ends = new int[R];
@@ -91,9 +96,9 @@ public class MPVRPSeqVar {
 
         for (int i = 0; i < R; i++) {
             Request req = requests.get(i);
-            starts[i] = i;
-            ends[i] = R + i;
-            load[i] = req.quantity();
+            starts[i] = i;              // Pickup node index
+            ends[i] = R + i;            // Drop node index
+            load[i] = req.quantity();   // Demand load
 
             nodeKind[i] = NODE_PICKUP;
             nodeKind[R + i] = NODE_DROP;
@@ -107,7 +112,9 @@ public class MPVRPSeqVar {
         int maxArc = Arrays.stream(dist).flatMapToInt(Arrays::stream).max().orElse(10000);
         int totalDemand = Arrays.stream(load).sum();
 
-        // ===================== decision variables =====================
+        // =========================================================================
+        // 2. Decision Variables
+        // =========================================================================
         CPSeqVar[] route = new CPSeqVar[V];
         CPIntVar[] distV = new CPIntVar[V];
         CPIntVar[] loadV = new CPIntVar[V];
@@ -131,14 +138,18 @@ public class MPVRPSeqVar {
 
         CPIntVar sumDistance = sum(distV);
 
-        // ===================== constraints =====================
+        // =========================================================================
+        // 3. Sequence Constraints
+        // =========================================================================
 
         for (int v = 0; v < V; v++) {
+            // Traverse sequence distance and changeover cost propagation
             cp.post(new Distance(route[v], dist, distV[v]));
+
             // Capacity constraint over pickup/drop activities
             cp.post(new Cumulative(route[v], starts, ends, load, cap[v]));
 
-            // Carried load by vehicle
+            // Vehicle total carried load aggregation
             CPIntVar[] servedLoad = new CPIntVar[R];
             for (int i = 0; i < R; i++) {
                 servedLoad[i] = mul(route[v].getNodeVar(ends[i]).isRequired(), load[i]);
@@ -146,21 +157,20 @@ public class MPVRPSeqVar {
             cp.post(new Sum(servedLoad, loadV[v]));
         }
 
-        // Each drop & pickup node pair belongs to exactly one vehicle route (or 0 if unserved)
+        // Request Coverage: each pickup & drop pair must be served by exactly 1 vehicle
         for (int i = 0; i < R; i++) {
             CPIntVar[] dropVisits = new CPIntVar[V];
             CPIntVar[] pickupVisits = new CPIntVar[V];
             for (int v = 0; v < V; v++) {
                 dropVisits[v] = route[v].getNodeVar(ends[i]).isRequired();
                 pickupVisits[v] = route[v].getNodeVar(starts[i]).isRequired();
-                // Pickup and drop must be served by the same vehicle
+                // Pickup and drop must belong to the same vehicle route
                 cp.post(eq(dropVisits[v], pickupVisits[v]));
             }
-            // Exactly 1 vehicle serves each request
             cp.post(new Sum(dropVisits, 1));
         }
 
-        // Depot Stock Constraint across all requests
+        // Physical Depot Stock Constraint check
         for (int d = 0; d < inst.nDepotsRead; d++) {
             int depotId = inst.depots[d].id();
             for (int p = 0; p < P; p++) {
@@ -183,8 +193,9 @@ public class MPVRPSeqVar {
             }
         }
 
-        // ===================== insertion-based search =====================
-
+        // =========================================================================
+        // 4. Insertion-Based Search Strategy
+        // =========================================================================
         Integer[] routingNodes = IntStream.range(0, R).boxed().toArray(Integer[]::new);
         int[] insertions = new int[nNodes];
 
@@ -253,8 +264,9 @@ public class MPVRPSeqVar {
             }, () -> cp.post(notBetween(chosen, chosenPred, dropNode, chosenSucc)));
         };
 
-        // ===================== solve =====================
-
+        // =========================================================================
+        // 5. Optimization & Solution Formatting
+        // =========================================================================
         DFSearch search = makeDfs(cp, branching);
         Objective objective = cp.minimize(sumDistance);
         final SolutionData[] bestSolution = new SolutionData[1];
@@ -286,6 +298,10 @@ public class MPVRPSeqVar {
 
         System.out.println(stats);
     }
+
+    // =========================================================================
+    // 6. Auxiliary Helper Methods
+    // =========================================================================
 
     private static boolean isFeasibleInsertion(int node, int pred, int succ, int[] nodeKind, int[] nodeProduct) {
         if (nodeKind[node] == NODE_PICKUP) {

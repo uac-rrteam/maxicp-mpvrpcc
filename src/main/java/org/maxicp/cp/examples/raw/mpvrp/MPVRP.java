@@ -23,26 +23,36 @@ import static org.maxicp.search.Searches.branch;
 import static org.maxicp.search.Searches.selectMin;
 import static org.maxicp.search.Searches.EMPTY;
 
+/**
+ * Multi-Product Vehicle Routing Problem with Changeover Cost (MPVRP-CC)
+ *
+ * @author Rosas Behoundja
+ */
 public class MPVRP {
 
+    // Node Type Constants
     private static final int GARAGE = 1;
     private static final int DEPOT = 2;
     private static final int REQUEST = 3;
+
+    /** Scaling factor to convert floating-point demands/costs into integer CP domains. */
     private static final int SCALE = 100;
 
     public static void main(String[] args) throws IOException {
-        String instancePath = args.length > 0 ? args[0] : "data/MPVRPCC/inst/MPVRP_134_s11_d3_p2.dat";
+        String instancePath = args.length > 0 ? args[0] : "data/MPVRPCC/inst/MPVRP_036_s5_d6_p3.dat";
         MPVRPInstance inst = MPVRPInstance.read(instancePath);
         CPSolver cp = makeSolver();
 
-        // ===================== data =====================
+        // =========================================================================
+        // 1. Problem Data & Graph Node Indexing
+        // =========================================================================
         int V = inst.nVehicules;
         int P = inst.nProds;
 
         int nDepots = inst.nDepotProducts;
         int nGarages = inst.nGarages;
         int nRequests = inst.nRequests;
-        int N = nDepots + nGarages + nRequests; // Total nodes in decision space
+        int N = nDepots + nGarages + nRequests; // Total node count in decision space
 
         // Node metadata arrays mapped by globalId
         int[] nodeType = new int[N];
@@ -50,61 +60,70 @@ public class MPVRP {
         int[] nodeDepotId = new int[N];
         Arrays.fill(nodeDepotId, -1);
 
+        // Indices [0 .. nDepots - 1]: Depot-Product nodes
         for (int i = 0; i < nDepots; i++) {
             nodeType[i] = DEPOT;
             nodeProduct[i] = inst.depotProducts[i].product();
             nodeDepotId[i] = inst.depotProducts[i].id();
         }
+        // Indices [nDepots .. nDepots + nGarages - 1]: Garage nodes
         for (int i = 0; i < nGarages; i++) {
             nodeType[nDepots + i] = GARAGE;
             nodeProduct[nDepots + i] = -1;
         }
+        // Indices [nDepots + nGarages .. N - 1]: Station Request nodes
         for (int i = 0; i < nRequests; i++) {
             nodeType[nDepots + nGarages + i] = REQUEST;
             nodeProduct[nDepots + nGarages + i] = inst.requests[i].product();
         }
 
+        // Indicator array: 1 if node is a Request, 0 otherwise
         int[] isRequestNode = new int[N];
         for (int i = 0; i < N; i++) {
             isRequestNode[i] = (nodeType[i] == REQUEST) ? 1 : 0;
         }
 
+        // Vehicle fleet metadata
         int[] departure = new int[V];
         int[] initProd = new int[V];
         int[] cap = new int[V];
         for (int v = 0; v < V; v++) {
             departure[v] = inst.vehicules[v].startG().globalId();
-            initProd[v] = inst.vehicules[v].initProd(); // Already 0-indexed from parser
+            initProd[v] = inst.vehicules[v].initProd(); // 0-indexed product ID
             cap[v] = (int) Math.round(inst.vehicules[v].capacity() * SCALE);
         }
 
-        // ===================== decisions variables =====================
-        CPIntVar[][] succ = new CPIntVar[V][N];
-        CPIntVar[][] pred = new CPIntVar[V][N];
-        CPIntVar[][] load = new CPIntVar[V][N];
-        CPIntVar[][] delivered = new CPIntVar[V][N];
+        // =========================================================================
+        // 2. Decision Variables
+        // =========================================================================
+        CPIntVar[][] succ = new CPIntVar[V][N];      // Successor node of node i on vehicle v's route
+        CPIntVar[][] pred = new CPIntVar[V][N];      // Predecessor node of node i on vehicle v's route
+        CPIntVar[][] load = new CPIntVar[V][N];      // Remaining load after departing node i
+        CPIntVar[][] delivered = new CPIntVar[V][N]; // Quantity delivered at node i by vehicle v
 
-        CPIntVar[][] distStep = new CPIntVar[V][N];
-        CPIntVar[][] rinseStep = new CPIntVar[V][N];
+        CPIntVar[][] distStep = new CPIntVar[V][N];  // Distance of transition (i -> succ[v][i])
+        CPIntVar[][] rinseStep = new CPIntVar[V][N]; // Changeover cost of transition (i -> succ[v][i])
 
         for (int v = 0; v < V; v++) {
             succ[v] = makeIntVarArray(cp, N, N);
             pred[v] = makeIntVarArray(cp, N, N);
             load[v] = makeIntVarArray(cp, N, cap[v] + 1);
             delivered[v] = makeIntVarArray(cp, N, cap[v] + 1);
-            distStep[v] = makeIntVarArray(cp, N, 10000000);
-            rinseStep[v] = makeIntVarArray(cp, N, 10000000);
+            distStep[v] = makeIntVarArray(cp, N, 10_000_000);
+            rinseStep[v] = makeIntVarArray(cp, N, 10_000_000);
         }
 
-        // ===================== constraints =====================
+        // =========================================================================
+        // 3. Vehicle Constraints
+        // =========================================================================
         for (int v = 0; v < V; v++) {
             int G_v = departure[v];
 
-            // SubCircuit and InversePerm
+            // SubCircuit and InversePerm to enforce single valid cycle per vehicle
             cp.post(new SubCircuit(succ[v]));
             cp.post(new InversePerm(succ[v], pred[v]));
 
-            // Garage constraints: do not visit other vehicles' home garages
+            // Prevent vehicle v from visiting garages belonging to other vehicles
             for (int g = nDepots; g < nDepots + nGarages; g++) {
                 if (g != G_v) {
                     cp.post(eq(succ[v][g], g));
@@ -126,6 +145,10 @@ public class MPVRP {
                     int typeI = nodeType[i];
                     int typeJ = nodeType[j];
 
+                    // Transition Domain Rules:
+                    // Garage -> Depot
+                    // Depot -> Request (same product only)
+                    // Request -> Request (same product) | Depot | Home Garage
                     if (typeI == GARAGE && i == G_v && typeJ == DEPOT) {
                         allowed = true;
                     } else if (typeI == DEPOT && typeJ == REQUEST && nodeProduct[i] == nodeProduct[j]) {
@@ -141,7 +164,7 @@ public class MPVRP {
                     } else {
                         edgeDist[i][j] = (int) Math.round(inst.distMatrix[i][j] * SCALE);
 
-                        // Changeover cost logic (incurred when transitioning into a depot)
+                        // Tank cleaning changeover cost when transitioning into a depot node
                         if (typeI == GARAGE && typeJ == DEPOT) {
                             edgeRinse[i][j] = (int) Math.round(inst.changeoverCost[initProd[v]][nodeProduct[j]] * SCALE);
                         } else if (typeI == REQUEST && typeJ == DEPOT) {
@@ -152,9 +175,11 @@ public class MPVRP {
                     }
                 }
 
+                // Channel transition distance & rinse cost to variables
                 cp.post(new Element1D(edgeDist[i], succ[v][i], distStep[v][i]));
                 cp.post(new Element1D(edgeRinse[i], succ[v][i], rinseStep[v][i]));
 
+                // Reification: isVisited is 1 iff succ[v][i] != i
                 CPBoolVar isVisited = isNeq(succ[v][i], i);
 
                 if (nodeType[i] == GARAGE) {
@@ -162,15 +187,15 @@ public class MPVRP {
                     cp.post(eq(load[v][i], 0));
                 } else if (nodeType[i] == DEPOT) {
                     cp.post(eq(delivered[v][i], 0));
-                    // Depot load: 0 if unvisited, >= 1 if visited
+                    // Depot load is 0 if unvisited, and >= 1 if visited
                     cp.post(le(load[v][i], mul(isVisited, cap[v])));
                     cp.post(ge(load[v][i], isVisited));
                 } else if (nodeType[i] == REQUEST) {
-                    // Delivery bounds: 0 if unvisited, >= 1 if visited
+                    // Delivery bounds: 0 if unvisited, >= 1 if visited (no empty visits)
                     cp.post(le(delivered[v][i], mul(isVisited, cap[v])));
                     cp.post(ge(delivered[v][i], isVisited));
 
-                    // Capacity flow along request sequence: load[v][i] + delivered[v][i] == load[v][pred[v][i]]
+                    // Load conservation along request sequence: load[v][i] + delivered[v][i] == load[v][pred[v][i]]
                     CPIntVar loadBefore = makeIntVar(cp, 0, cap[v]);
                     cp.post(new Element1DVar(load[v], pred[v][i], loadBefore));
                     cp.post(sum(new CPIntVar[]{load[v][i], delivered[v][i]}, loadBefore));
@@ -182,6 +207,10 @@ public class MPVRP {
                 }
             }
         }
+
+        // =========================================================================
+        // 4. Global Fleet Constraints
+        // =========================================================================
 
         // Demand satisfaction constraint across fleet
         for (int r = 0; r < nRequests; r++) {
@@ -217,16 +246,18 @@ public class MPVRP {
             }
         }
 
-        // Objectives
+        // =========================================================================
+        // 5. Objective Function & Search Strategy
+        // =========================================================================
         CPIntVar[] allDist = Arrays.stream(distStep).flatMap(Arrays::stream).toArray(CPIntVar[]::new);
         CPIntVar[] allRinse = Arrays.stream(rinseStep).flatMap(Arrays::stream).toArray(CPIntVar[]::new);
         CPIntVar totalDist = sum(allDist);
         CPIntVar totalRinse = sum(allRinse);
         CPIntVar objectiveVar = sum(totalDist, totalRinse);
 
-        // ===================== search =====================
         CPIntVar[] allSuccVars = Arrays.stream(succ).flatMap(Arrays::stream).toArray(CPIntVar[]::new);
 
+        // First-fail branching on successor variables
         Supplier<Runnable[]> branching = () -> {
             CPIntVar xs = selectMin(allSuccVars,
                     x -> x.size() > 1,
@@ -283,10 +314,14 @@ public class MPVRP {
             writeSolution(outFileName, inst, bestSucc, bestDeliv, bestRinse[0], bestDist[0], bestChanges[0], elapsed, nodeType, nodeProduct, departure, initProd);
         });
 
-        System.out.println("Starting search...");
+        System.out.println("Starting search (Successor Formulation)...");
         SearchStatistics stats = search.optimize(obj);
         System.out.println(stats);
     }
+
+    // =========================================================================
+    // 6. Solution Output Writer (solution_format.md compliant)
+    // =========================================================================
 
     private static void writeSolution(String filename, MPVRPInstance inst, int[][] bestSucc, int[][] bestDelivered,
                                       double totalRinse, double totalDist, int nChanges, double elapsed,
