@@ -10,7 +10,12 @@ import org.maxicp.search.Objective;
 import org.maxicp.search.SearchStatistics;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
 import java.util.function.Supplier;
 
 import static org.maxicp.cp.CPFactory.*;
@@ -26,7 +31,7 @@ public class MPVRP {
     private static final int SCALE = 100;
 
     public static void main(String[] args) throws IOException {
-        String instancePath = args.length > 0 ? args[0] : "data/MPVRPCC/one.dat";
+        String instancePath = args.length > 0 ? args[0] : "data/MPVRPCC/inst/MPVRP_036_s5_d6_p3.dat";
         MPVRPInstance inst = MPVRPInstance.read(instancePath);
         CPSolver cp = makeSolver();
 
@@ -79,7 +84,7 @@ public class MPVRP {
             pred[v] = makeIntVarArray(cp, N, N);
             load[v] = makeIntVarArray(cp, N, cap[v] + 1);
             delivered[v] = makeIntVarArray(cp, N, cap[v] + 1);
-            distStep[v] = makeIntVarArray(cp, N, 10000000); // suitably large
+            distStep[v] = makeIntVarArray(cp, N, 10000000); 
             rinseStep[v] = makeIntVarArray(cp, N, 10000000);
         }
 
@@ -189,12 +194,159 @@ public class MPVRP {
         DFSearch search = makeDfs(cp, branching);
         Objective obj = cp.minimize(objectiveVar);
         
+        int[][] bestSucc = new int[V][N];
+        int[][] bestDeliv = new int[V][N];
+        double[] bestDist = {0};
+        double[] bestRinse = {0};
+        int[] bestChanges = {0};
+        boolean[] hasSolution = {false};
+        long t0 = System.currentTimeMillis();
+        
         search.onSolution(() -> {
+            hasSolution[0] = true;
+            bestDist[0] = totalDist.min() / (double) SCALE;
+            bestRinse[0] = totalRinse.min() / (double) SCALE;
+            
+            int changes = 0;
+            for (int v = 0; v < V; v++) {
+                for (int i = 0; i < N; i++) {
+                    bestSucc[v][i] = succ[v][i].min();
+                    bestDeliv[v][i] = delivered[v][i].min();
+                }
+                
+                int G_v = departure[v];
+                if (bestSucc[v][G_v] == G_v) continue;
+                int curr = G_v;
+                int currentProd = initProd[v];
+                curr = bestSucc[v][curr];
+                while(curr != G_v) {
+                    if (nodeType[curr] == DEPOT) {
+                        int prod = nodeProduct[curr];
+                        if (prod != currentProd) {
+                            changes++;
+                            currentProd = prod;
+                        }
+                    }
+                    curr = bestSucc[v][curr];
+                }
+            }
+            bestChanges[0] = changes;
             System.out.println("Solution found! Objective: " + (objectiveVar.min() / (double)SCALE));
+
+            double elapsed = (System.currentTimeMillis() - t0) / 1000.0;
+            String outFileName = "Sol_MPVRP_" + inst.uuid.replace("-", "_") + ".dat";
+            writeSolution(outFileName, inst, bestSucc, bestDeliv, bestRinse[0], bestDist[0], bestChanges[0], elapsed, nodeType, nodeProduct, departure, initProd);
+
         });
 
         System.out.println("Starting search...");
         SearchStatistics stats = search.optimize(obj);
         System.out.println(stats);
+        
+//        if (hasSolution[0]) {
+//            double elapsed = (System.currentTimeMillis() - t0) / 1000.0;
+//            String outFileName = "Sol_MPVRP_" + inst.uuid.replace("-", "_") + ".dat";
+//            writeSolution(outFileName, inst, bestSucc, bestDeliv, bestRinse[0], bestDist[0], bestChanges[0], elapsed, nodeType, nodeProduct, departure, initProd);
+//        }
+    }
+
+    private static void writeSolution(String filename, MPVRPInstance inst, int[][] bestSucc, int[][] bestDelivered, 
+                                      double totalRinse, double totalDist, int nChanges, double elapsed, 
+                                      int[] nodeType, int[] nodeProduct, int[] departure, int[] initProd) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            int usedVehicles = 0;
+            
+            for (int v = 0; v < bestSucc.length; v++) {
+                int G_v = departure[v];
+                if (bestSucc[v][G_v] == G_v) continue;
+                
+                usedVehicles++;
+                List<String> visitSeq = new ArrayList<>();
+                List<String> prodSeq = new ArrayList<>();
+                
+                int curr = G_v;
+                int currentProd = initProd[v];
+                double cumulativeRinse = 0.0;
+                
+                visitSeq.add(String.valueOf(inst.garages[G_v - inst.nDepotProducts].id()));
+                prodSeq.add(currentProd + "(" + formatCost(0.0) + ")");
+                
+                curr = bestSucc[v][curr];
+                while (curr != G_v) {
+                    int type = nodeType[curr];
+                    if (type == DEPOT) {
+                        int prod = nodeProduct[curr];
+                        if (prod != currentProd) {
+                            cumulativeRinse += inst.changeoverCost[currentProd][prod];
+                            currentProd = prod;
+                        }
+                        
+                        double load = 0;
+                        int look = bestSucc[v][curr];
+                        while (look != G_v && nodeType[look] != DEPOT) {
+                            if (nodeType[look] == REQUEST) {
+                                load += bestDelivered[v][look] / (double) SCALE;
+                            }
+                            look = bestSucc[v][look];
+                        }
+                        visitSeq.add(inst.depotProducts[curr].id() + " [" + formatNumber(load) + "]");
+                        prodSeq.add(currentProd + "(" + formatCost(cumulativeRinse) + ")");
+                    } else if (type == REQUEST) {
+                        int reqIdx = curr - inst.nDepotProducts - inst.nGarages;
+                        double deliv = bestDelivered[v][curr] / (double) SCALE;
+                        visitSeq.add(inst.requests[reqIdx].id() + " (" + formatNumber(deliv) + ")");
+                        prodSeq.add(currentProd + "(" + formatCost(cumulativeRinse) + ")");
+                    }
+                    curr = bestSucc[v][curr];
+                }
+                
+                visitSeq.add(String.valueOf(inst.garages[G_v - inst.nDepotProducts].id()));
+                prodSeq.add(currentProd + "(" + formatCost(cumulativeRinse) + ")");
+                
+                sb.append(v + 1).append(": ").append(String.join(" - ", visitSeq)).append("\n");
+                sb.append(v + 1).append(": ").append(String.join(" - ", prodSeq)).append("\n\n");
+            }
+            
+            sb.append(usedVehicles).append("\n");
+            sb.append(nChanges).append("\n");
+            sb.append(formatCost(totalRinse)).append("\n");
+            sb.append(formatCost(totalDist)).append("\n");
+            sb.append(getProcessorModel()).append("\n");
+            sb.append(String.format(Locale.US, "%.3f", elapsed)).append("\n");
+            
+            Files.writeString(Path.of(filename), sb.toString());
+            System.out.println("Solution written to " + filename);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static String formatCost(double value) {
+        return String.format(Locale.US, "%.2f", value);
+    }
+
+    private static String formatNumber(double value) {
+        double rounded = Math.rint(value);
+        if (Math.abs(value - rounded) < 1e-9) {
+            return Long.toString(Math.round(rounded));
+        }
+        return String.format(Locale.US, "%.2f", value);
+    }
+
+    private static String getProcessorModel() {
+        try {
+            List<String> lines = Files.readAllLines(Path.of("/proc/cpuinfo"));
+            for (String line : lines) {
+                if (line.startsWith("model name")) {
+                    int idx = line.indexOf(':');
+                    if (idx >= 0) {
+                        return line.substring(idx + 1).trim();
+                    }
+                }
+            }
+        } catch (IOException ignored) {
+        }
+        return System.getProperty("os.name") + " " + System.getProperty("os.arch");
     }
 }
