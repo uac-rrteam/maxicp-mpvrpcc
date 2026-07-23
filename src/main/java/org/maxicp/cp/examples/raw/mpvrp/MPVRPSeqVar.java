@@ -56,9 +56,6 @@ public class MPVRPSeqVar {
         MPVRPInstance inst = MPVRPInstance.read(inputFile);
         CPSolver cp = makeSolver();
 
-        // =========================================================================
-        // 1. Problem Data & Fleet Parameters
-        // =========================================================================
         int V = inst.nVehicules;
         int S = inst.nStations;
         int P = inst.nProds;
@@ -112,9 +109,7 @@ public class MPVRPSeqVar {
         int maxArc = Arrays.stream(dist).flatMapToInt(Arrays::stream).max().orElse(10000);
         int totalDemand = Arrays.stream(load).sum();
 
-        // =========================================================================
-        // 2. Decision Variables
-        // =========================================================================
+        // decisions variables
         CPSeqVar[] route = new CPSeqVar[V];
         CPIntVar[] distV = new CPIntVar[V];
         CPIntVar[] loadV = new CPIntVar[V];
@@ -138,10 +133,7 @@ public class MPVRPSeqVar {
 
         CPIntVar sumDistance = sum(distV);
 
-        // =========================================================================
-        // 3. Sequence Constraints
-        // =========================================================================
-
+        // constraints
         for (int v = 0; v < V; v++) {
             // Traverse sequence distance and changeover cost propagation
             cp.post(new Distance(route[v], dist, distV[v]));
@@ -193,9 +185,7 @@ public class MPVRPSeqVar {
             }
         }
 
-        // =========================================================================
-        // 4. Insertion-Based Search Strategy
-        // =========================================================================
+        // search strategy
         Integer[] routingNodes = IntStream.range(0, R).boxed().toArray(Integer[]::new);
         int[] insertions = new int[nNodes];
 
@@ -264,9 +254,7 @@ public class MPVRPSeqVar {
             }, () -> cp.post(notBetween(chosen, chosenPred, dropNode, chosenSucc)));
         };
 
-        // =========================================================================
-        // 5. Optimization & Solution Formatting
-        // =========================================================================
+        // objective function
         DFSearch search = makeDfs(cp, branching);
         Objective objective = cp.minimize(sumDistance);
         final SolutionData[] bestSolution = new SolutionData[1];
@@ -293,15 +281,13 @@ public class MPVRPSeqVar {
             }
         });
 
-        System.out.println("Starting search (CPSeqVar)...");
+        System.out.println("Starting search...");
         SearchStatistics stats = search.optimize(objective);
 
         System.out.println(stats);
     }
 
-    // =========================================================================
-    // 6. Auxiliary Helper Methods
-    // =========================================================================
+    // help method
 
     private static boolean isFeasibleInsertion(int node, int pred, int succ, int[] nodeKind, int[] nodeProduct) {
         if (nodeKind[node] == NODE_PICKUP) {
@@ -512,15 +498,9 @@ public class MPVRPSeqVar {
         return inst.vehicules[vehicle].startG().globalId();
     }
 
-    private static int[][] buildArcCosts(MPVRPInstance inst,
-                                         int[] nodeKind,
-                                         int[] nodeProduct,
-                                         int[] nodeGlobalId,
-                                         int[] startVehicle,
-                                         int[] initProd,
-                                         int[] departure,
-                                         int nRequest,
-                                         int nVehicle) {
+    private static int[][] buildArcCosts(MPVRPInstance inst, int[] nodeKind, int[] nodeProduct,
+                                         int[] nodeGlobalId, int[] startVehicle, int[] initProd,
+                                         int[] departure, int nRequest, int nVehicle) {
         for (int v = 0; v < nVehicle; v++) {
             int start = 2 * nRequest + v;
             int end = 2 * nRequest + nVehicle + v;

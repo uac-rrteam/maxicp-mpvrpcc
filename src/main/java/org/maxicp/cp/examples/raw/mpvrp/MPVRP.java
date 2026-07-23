@@ -43,9 +43,6 @@ public class MPVRP {
         MPVRPInstance inst = MPVRPInstance.read(instancePath);
         CPSolver cp = makeSolver();
 
-        // =========================================================================
-        // 1. Problem Data & Graph Node Indexing
-        // =========================================================================
         int V = inst.nVehicules;
         int P = inst.nProds;
 
@@ -93,9 +90,7 @@ public class MPVRP {
             cap[v] = (int) Math.round(inst.vehicules[v].capacity() * SCALE);
         }
 
-        // =========================================================================
-        // 2. Decision Variables
-        // =========================================================================
+        // decisions variables
         CPIntVar[][] succ = new CPIntVar[V][N];      // Successor node of node i on vehicle v's route
         CPIntVar[][] pred = new CPIntVar[V][N];      // Predecessor node of node i on vehicle v's route
         CPIntVar[][] load = new CPIntVar[V][N];      // Remaining load after departing node i
@@ -113,9 +108,7 @@ public class MPVRP {
             rinseStep[v] = makeIntVarArray(cp, N, 10_000_000);
         }
 
-        // =========================================================================
-        // 3. Vehicle Constraints
-        // =========================================================================
+        // constraints
         for (int v = 0; v < V; v++) {
             int G_v = departure[v];
 
@@ -208,10 +201,6 @@ public class MPVRP {
             }
         }
 
-        // =========================================================================
-        // 4. Global Fleet Constraints
-        // =========================================================================
-
         // Demand satisfaction constraint across fleet
         for (int r = 0; r < nRequests; r++) {
             int idx = nDepots + nGarages + r;
@@ -246,9 +235,7 @@ public class MPVRP {
             }
         }
 
-        // =========================================================================
-        // 5. Objective Function & Search Strategy
-        // =========================================================================
+        // objective function + search strategy
         CPIntVar[] allDist = Arrays.stream(distStep).flatMap(Arrays::stream).toArray(CPIntVar[]::new);
         CPIntVar[] allRinse = Arrays.stream(rinseStep).flatMap(Arrays::stream).toArray(CPIntVar[]::new);
         CPIntVar totalDist = sum(allDist);
@@ -275,11 +262,9 @@ public class MPVRP {
         double[] bestDist = {0};
         double[] bestRinse = {0};
         int[] bestChanges = {0};
-        boolean[] hasSolution = {false};
         long t0 = System.currentTimeMillis();
 
         search.onSolution(() -> {
-            hasSolution[0] = true;
             bestDist[0] = totalDist.min() / (double) SCALE;
             bestRinse[0] = totalRinse.min() / (double) SCALE;
 
@@ -319,9 +304,7 @@ public class MPVRP {
         System.out.println(stats);
     }
 
-    // =========================================================================
-    // 6. Solution Output Writer (solution_format.md compliant)
-    // =========================================================================
+    // help functions
 
     private static void writeSolution(String filename, MPVRPInstance inst, int[][] bestSucc, int[][] bestDelivered,
                                       double totalRinse, double totalDist, int nChanges, double elapsed,
