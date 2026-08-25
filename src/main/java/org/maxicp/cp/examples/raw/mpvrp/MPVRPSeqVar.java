@@ -48,7 +48,7 @@ public class MPVRPSeqVar {
     private record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges, double transitionCost, double distance) {}
 
     public static void main(String[] args) throws Exception {
-        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_013_s7_d2_p2.dat";
+        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_086_s50_d6_p2.dat";
         String outputFile = args.length > 1 ? args[1] : null;
 
         MPVRPInstance inst = MPVRPInstance.read(inputFile);
