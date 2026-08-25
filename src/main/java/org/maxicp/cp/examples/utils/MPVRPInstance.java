@@ -8,23 +8,29 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * Data parser and container for the Multi-Product Vehicle Routing Problem
- * with Changeover Costs (MPVRP-CC).
+ * Parser for MPVRP-CC problem instances from
+ * <a href="https://github.com/uac-rrteam/instances-mpvrp-cc">github</a>.
  *
- * <p>Reads instances from benchmark .dat files and builds node graphs.</p>
+ * <h3>File Format:</h3>
+ * <pre>
+ * # &lt;uuid&gt;
+ * NbProducts NbDepots NbGarages NbStations NbVehicles
+ * &lt;product transition matrix&gt;
+ * &lt;vehicles&gt;
+ * &lt;depots&gt;
+ * &lt;garages&gt;
+ * &lt;service stations&gt;
+ * </pre>
  *
  * @author Rosas Behoundja
  */
 public class MPVRPInstance {
 
-    // =========================================================================
-    // Instance Metadata & Dimensions
-    // =========================================================================
     public String uuid;
     public int nProds;           // Number of product types
     public int nDepotsRead;      // Number of physical depots in instance file
     public int nDepots;          // Number of physical depots
-    public int nDepotProducts;  // Total depot-product nodes in graph (including copies)
+    public int nDepotProducts;  // Total positive-stock depot-product nodes in graph
     public int nGarages;        // Number of garages
     public int nStationsRead;   // Number of physical stations in instance file
     public int nStations;       // Number of physical stations
@@ -32,7 +38,7 @@ public class MPVRPInstance {
     public int nVehicules;      // Number of available vehicles
 
     /** Changeover cost matrix: changeoverCost[p1][p2] = cost of cleaning tank from product p1 to p2 */
-    public double[][] changeoverCost;
+    public int[][] changeoverCost;
 
     // Entity collections
     public Vehicule[] vehicules;
@@ -43,71 +49,55 @@ public class MPVRPInstance {
     public Station[] stations;
 
     /** Global pairwise distance matrix across all graph nodes */
-    public double[][] distMatrix;
+    public int[][] distMatrix;
 
-    // =========================================================================
-    // Data Record Definitions
-    // =========================================================================
+    public enum NodeType {
+        STATION,
+        GARAGE,
+        DEPOT
+    }
 
     /** Represents a vehicle with capacity, initial home garage, and starting product. */
-    public record Vehicule(int id, double capacity, GarageNode startG, int initProd) {}
+    public record Vehicule(int id, int capacity, GarageNode startG, int initProd) {}
 
     /** Represents a physical depot with stocks for all products. */
-    public record Depot(int id, double x, double y, double[] stocks) {}
+    public record Depot(int id, int x, int y, int[] stocks) {}
 
     /** Represents a physical station with product demands. */
-    public record Station(int id, double x, double y, double[] demand) {}
+    public record Station(int id, int x, int y, int[] demand) {}
 
     /** Base interface for nodes in the execution graph. */
     public sealed interface MPVRPNode permits RequestNode, GarageNode, DepotProductNode {
         int id();         // 1-based entity ID from instance file
         int globalId();   // 0-based unique index in the distance matrix
-        double x();
-        double y();
-        int type();       // 0 = Request, 1 = Garage, 2 = Depot-Product
+        int x();
+        int y();
+        NodeType type();
 
-        default double distance(MPVRPNode o) {
-            double dx = this.x() - o.x();
-            double dy = this.y() - o.y();
-            return Math.hypot(dx, dy);
+        default int distance(MPVRPNode o) {
+            long dx = (long) this.x() - o.x();
+            long dy = (long) this.y() - o.y();
+            return (int) Math.round(Math.hypot(dx, dy));
         }
     }
 
     /** Garage node representing vehicle departure and arrival location. */
-    public record GarageNode(int id, int globalId, double x, double y) implements MPVRPNode {
-        @Override public int type() { return 1; }
+    public record GarageNode(int id, int globalId, int x, int y) implements MPVRPNode {
+        @Override public NodeType type() { return NodeType.GARAGE; }
     }
 
     /** Request node representing a specific station's demand for a single product. */
-    public record RequestNode(int id, int globalId, double x, double y, int product, double demand) implements MPVRPNode {
-        @Override public int type() { return 0; }
+    public record RequestNode(int id, int globalId, int x, int y, int product, int demand) implements MPVRPNode {
+        @Override public NodeType type() { return NodeType.STATION; }
     }
 
     /** Depot-product node representing loading capability for a specific product at a depot. */
-    public record DepotProductNode(int id, int globalId, double x, double y, int product, double stock) implements MPVRPNode {
-        @Override public int type() { return 2; }
+    public record DepotProductNode(int id, int globalId, int x, int y, int product, int stock) implements MPVRPNode {
+        @Override public NodeType type() { return NodeType.DEPOT; }
     }
 
-    // =========================================================================
-    // Factory Reader Methods
-    // =========================================================================
-
-    /**
-     * Reads an MPVRP-CC instance file with default 3 node copies per depot-product pair
-     * to support multiple visits per depot.
-     */
+    /** Reads an MPVRP-CC instance file. */
     public static MPVRPInstance read(String filename) throws IOException {
-        return read(filename, 3);
-    }
-
-    /**
-     * Reads an MPVRP-CC instance file.
-     *
-     * @param filename Path to the .dat instance file.
-     * @param depotCopies Number of node copies per depot-product pair to allow multiple mini-route visits.
-     * @return Parsed MPVRPInstance object.
-     */
-    public static MPVRPInstance read(String filename, int depotCopies) throws IOException {
         MPVRPInstance inst = new MPVRPInstance();
         InputReader reader = new InputReader(filename);
 
@@ -125,7 +115,7 @@ public class MPVRPInstance {
         inst.nStations = inst.nStationsRead;
 
         // Changeover cost matrix (nProds x nProds)
-        inst.changeoverCost = reader.getDoubleMatrix(inst.nProds, inst.nProds);
+        inst.changeoverCost = reader.getIntMatrix(inst.nProds, inst.nProds);
 
         // Vehicle fleet initialization
         int[] homeGarageIds = new int[inst.nVehicules];
@@ -133,7 +123,7 @@ public class MPVRPInstance {
 
         for (int i = 0; i < inst.nVehicules; i++) {
             int id = reader.getInt();
-            double capacity = reader.getDouble();
+            int capacity = reader.getInt();
             homeGarageIds[i] = reader.getInt();
             int initProd = reader.getInt() - 1; // Normalize to 0-based index [0..nProds-1]
             inst.vehicules[i] = new Vehicule(id, capacity, null, initProd);
@@ -141,22 +131,20 @@ public class MPVRPInstance {
 
         int currentGlobalId = 0;
 
-        // Physical Depots and Depot-Product Nodes (with copies)
+        // Physical Depots and Depot-Product Nodes
         inst.depots = new Depot[inst.nDepotsRead];
         List<DepotProductNode> depotList = new ArrayList<>();
         for (int i = 0; i < inst.nDepotsRead; i++) {
             int id = reader.getInt();
-            double x = reader.getDouble();
-            double y = reader.getDouble();
-            double[] stocks = new double[inst.nProds];
+            int x = reader.getInt();
+            int y = reader.getInt();
+            int[] stocks = new int[inst.nProds];
 
             for (int p = 0; p < inst.nProds; p++) {
-                double stock = reader.getDouble();
+                int stock = reader.getInt();
                 stocks[p] = stock;
                 if (stock > 0) {
-                    for (int c = 0; c < depotCopies; c++) {
-                        depotList.add(new DepotProductNode(id, currentGlobalId++, x, y, p, stock));
-                    }
+                    depotList.add(new DepotProductNode(id, currentGlobalId++, x, y, p, stock));
                 }
             }
             inst.depots[i] = new Depot(id, x, y, stocks);
@@ -168,7 +156,7 @@ public class MPVRPInstance {
         // Garages
         inst.garages = new GarageNode[inst.nGarages];
         for (int i = 0; i < inst.nGarages; i++) {
-            inst.garages[i] = new GarageNode(reader.getInt(), currentGlobalId++, reader.getDouble(), reader.getDouble());
+            inst.garages[i] = new GarageNode(reader.getInt(), currentGlobalId++, reader.getInt(), reader.getInt());
         }
 
         // Physical Stations and Station Request Nodes
@@ -176,12 +164,12 @@ public class MPVRPInstance {
         List<RequestNode> requestList = new ArrayList<>();
         for (int i = 0; i < inst.nStationsRead; i++) {
             int id = reader.getInt();
-            double x = reader.getDouble();
-            double y = reader.getDouble();
-            double[] demands = new double[inst.nProds];
+            int x = reader.getInt();
+            int y = reader.getInt();
+            int[] demands = new int[inst.nProds];
 
             for (int p = 0; p < inst.nProds; p++) {
-                double demand = reader.getDouble();
+                int demand = reader.getInt();
                 demands[p] = demand;
                 if (demand > 0) {
                     requestList.add(new RequestNode(id, currentGlobalId++, x, y, p, demand));
@@ -219,7 +207,7 @@ public class MPVRPInstance {
         allNodes.addAll(Arrays.asList(requests));
 
         int size = allNodes.size();
-        distMatrix = new double[size][size];
+        distMatrix = new int[size][size];
 
         for (int i = 0; i < size; i++) {
             for (int j = 0; j < size; j++) {

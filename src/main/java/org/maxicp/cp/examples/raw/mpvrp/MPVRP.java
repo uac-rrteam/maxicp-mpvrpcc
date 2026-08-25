@@ -39,7 +39,7 @@ public class MPVRP {
     private static final int SCALE = 100;
 
     public static void main(String[] args) throws IOException {
-        String instancePath = args.length > 0 ? args[0] : "data/MPVRPCC/inst/MPVRP_036_s5_d6_p3.dat";
+        String instancePath = args.length > 0 ? args[0] : "data/MPVRPCC/inst/MPVRP_086_s33_d2_p2.dat";
         MPVRPInstance inst = MPVRPInstance.read(instancePath);
         CPSolver cp = makeSolver();
 
@@ -156,7 +156,6 @@ public class MPVRP {
                         succ[v][i].remove(j);
                     } else {
                         edgeDist[i][j] = (int) Math.round(inst.distMatrix[i][j] * SCALE);
-
                         // Tank cleaning changeover cost when transitioning into a depot node
                         if (typeI == GARAGE && typeJ == DEPOT) {
                             edgeRinse[i][j] = (int) Math.round(inst.changeoverCost[initProd[v]][nodeProduct[j]] * SCALE);
