@@ -35,18 +35,20 @@ public class MPVRP {
     private static final int DEPOT = 2;
     private static final int REQUEST = 3;
 
-    /** Scaling factor to convert floating-point demands/costs into integer CP domains. */
-    private static final int SCALE = 100;
+    /** Local visit copies for each canonical depot-product node from the parser. */
+    private static final int DEPOT_VISIT_COPIES = 3;
 
     public static void main(String[] args) throws IOException {
-        String instancePath = args.length > 0 ? args[0] : "data/MPVRPCC/inst/MPVRP_086_s33_d2_p2.dat";
+        String instancePath = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_030_s5_d6_p4.dat";
+        String outputPath = args.length > 1 ? args[1] : defaultOutputPath(instancePath);
         MPVRPInstance inst = MPVRPInstance.read(instancePath);
         CPSolver cp = makeSolver();
 
         int V = inst.nVehicules;
         int P = inst.nProds;
 
-        int nDepots = inst.nDepotProducts;
+        int nCanonicalDepots = inst.nDepotProducts;
+        int nDepots = nCanonicalDepots * DEPOT_VISIT_COPIES;
         int nGarages = inst.nGarages;
         int nRequests = inst.nRequests;
         int N = nDepots + nGarages + nRequests; // Total node count in decision space
@@ -55,23 +57,28 @@ public class MPVRP {
         int[] nodeType = new int[N];
         int[] nodeProduct = new int[N];
         int[] nodeDepotId = new int[N];
+        int[] nodeGlobalId = new int[N];
         Arrays.fill(nodeDepotId, -1);
 
-        // Indices [0 .. nDepots - 1]: Depot-Product nodes
+        // Indices [0 .. nDepots - 1]: local copies of canonical Depot-Product nodes
         for (int i = 0; i < nDepots; i++) {
+            MPVRPInstance.DepotProductNode depot = inst.depotProducts[i / DEPOT_VISIT_COPIES];
             nodeType[i] = DEPOT;
-            nodeProduct[i] = inst.depotProducts[i].product();
-            nodeDepotId[i] = inst.depotProducts[i].id();
+            nodeProduct[i] = depot.product();
+            nodeDepotId[i] = depot.id();
+            nodeGlobalId[i] = depot.globalId();
         }
         // Indices [nDepots .. nDepots + nGarages - 1]: Garage nodes
         for (int i = 0; i < nGarages; i++) {
             nodeType[nDepots + i] = GARAGE;
             nodeProduct[nDepots + i] = -1;
+            nodeGlobalId[nDepots + i] = inst.garages[i].globalId();
         }
         // Indices [nDepots + nGarages .. N - 1]: Station Request nodes
         for (int i = 0; i < nRequests; i++) {
             nodeType[nDepots + nGarages + i] = REQUEST;
             nodeProduct[nDepots + nGarages + i] = inst.requests[i].product();
+            nodeGlobalId[nDepots + nGarages + i] = inst.requests[i].globalId();
         }
 
         // Indicator array: 1 if node is a Request, 0 otherwise
@@ -85,9 +92,9 @@ public class MPVRP {
         int[] initProd = new int[V];
         int[] cap = new int[V];
         for (int v = 0; v < V; v++) {
-            departure[v] = inst.vehicules[v].startG().globalId();
+            departure[v] = nDepots + inst.vehicules[v].startG().globalId() - nCanonicalDepots;
             initProd[v] = inst.vehicules[v].initProd(); // 0-indexed product ID
-            cap[v] = (int) Math.round(inst.vehicules[v].capacity() * SCALE);
+            cap[v] = inst.vehicules[v].capacity();
         }
 
         // decisions variables
@@ -115,6 +122,7 @@ public class MPVRP {
             // SubCircuit and InversePerm to enforce single valid cycle per vehicle
             cp.post(new SubCircuit(succ[v]));
             cp.post(new InversePerm(succ[v], pred[v]));
+            CPBoolVar homeGarageVisited = isNeq(succ[v][G_v], G_v);
 
             // Prevent vehicle v from visiting garages belonging to other vehicles
             for (int g = nDepots; g < nDepots + nGarages; g++) {
@@ -155,12 +163,13 @@ public class MPVRP {
                     if (!allowed) {
                         succ[v][i].remove(j);
                     } else {
-                        edgeDist[i][j] = (int) Math.round(inst.distMatrix[i][j] * SCALE);
-                        // Tank cleaning changeover cost when transitioning into a depot node
+                        edgeDist[i][j] = inst.distMatrix[nodeGlobalId[i]][nodeGlobalId[j]];
+                        // Every loading operation incurs its directed transition cost,
+                        // including the first loading and same-product reloads.
                         if (typeI == GARAGE && typeJ == DEPOT) {
-                            edgeRinse[i][j] = (int) Math.round(inst.changeoverCost[initProd[v]][nodeProduct[j]] * SCALE);
+                            edgeRinse[i][j] = inst.changeoverCost[initProd[v]][nodeProduct[j]];
                         } else if (typeI == REQUEST && typeJ == DEPOT) {
-                            edgeRinse[i][j] = (int) Math.round(inst.changeoverCost[nodeProduct[i]][nodeProduct[j]] * SCALE);
+                            edgeRinse[i][j] = inst.changeoverCost[nodeProduct[i]][nodeProduct[j]];
                         } else {
                             edgeRinse[i][j] = 0;
                         }
@@ -173,6 +182,11 @@ public class MPVRP {
 
                 // Reification: isVisited is 1 iff succ[v][i] != i
                 CPBoolVar isVisited = isNeq(succ[v][i], i);
+                if (i != G_v) {
+                    // A non-empty subcircuit must contain this vehicle's home
+                    // garage; otherwise it would be a disconnected delivery tour.
+                    cp.post(le(isVisited, homeGarageVisited));
+                }
 
                 if (nodeType[i] == GARAGE) {
                     cp.post(eq(delivered[v][i], 0));
@@ -203,21 +217,20 @@ public class MPVRP {
         // Demand satisfaction constraint across fleet
         for (int r = 0; r < nRequests; r++) {
             int idx = nDepots + nGarages + r;
-            int scaledDemand = (int) Math.round(inst.requests[r].demand() * SCALE);
+            int demand = inst.requests[r].demand();
             CPIntVar[] delivAllV = new CPIntVar[V];
             for (int v = 0; v < V; v++) {
                 delivAllV[v] = delivered[v][idx];
             }
-            cp.post(sum(delivAllV, scaledDemand));
+            cp.post(sum(delivAllV, demand));
         }
 
         // Total Depot Stock Constraint across all vehicles and depot node copies
         for (int d = 0; d < inst.nDepotsRead; d++) {
             int depotId = inst.depots[d].id();
             for (int p = 0; p < P; p++) {
-                double stockVal = inst.depots[d].stocks()[p];
-                if (stockVal <= 0) continue;
-                int scaledStock = (int) Math.round(stockVal * SCALE);
+                int stock = inst.depots[d].stocks()[p];
+                if (stock <= 0) continue;
 
                 List<CPIntVar> depotLoads = new ArrayList<>();
                 for (int i = 0; i < nDepots; i++) {
@@ -229,7 +242,7 @@ public class MPVRP {
                 }
                 if (!depotLoads.isEmpty()) {
                     CPIntVar totalDepotLoad = sum(depotLoads.toArray(new CPIntVar[0]));
-                    cp.post(le(totalDepotLoad, scaledStock));
+                    cp.post(le(totalDepotLoad, stock));
                 }
             }
         }
@@ -264,8 +277,8 @@ public class MPVRP {
         long t0 = System.currentTimeMillis();
 
         search.onSolution(() -> {
-            bestDist[0] = totalDist.min() / (double) SCALE;
-            bestRinse[0] = totalRinse.min() / (double) SCALE;
+            bestDist[0] = totalDist.min();
+            bestRinse[0] = totalRinse.min();
 
             int changes = 0;
             for (int v = 0; v < V; v++) {
@@ -291,14 +304,13 @@ public class MPVRP {
                 }
             }
             bestChanges[0] = changes;
-            System.out.println("Solution found! Objective: " + (objectiveVar.min() / (double) SCALE));
+            System.out.println("Solution found! Objective: " + objectiveVar.min());
 
             double elapsed = (System.currentTimeMillis() - t0) / 1000.0;
-            String outFileName = "Sol_MPVRP_" + inst.uuid.replace("-", "_") + ".dat";
-            writeSolution(outFileName, inst, bestSucc, bestDeliv, bestRinse[0], bestDist[0], bestChanges[0], elapsed, nodeType, nodeProduct, departure, initProd);
+            writeSolution(outputPath, inst, bestSucc, bestDeliv, bestRinse[0], bestDist[0], bestChanges[0], elapsed, nodeType, nodeProduct, departure, initProd);
         });
 
-        System.out.println("Starting search (Successor Formulation)...");
+        System.out.println("Starting search ...");
         SearchStatistics stats = search.optimize(obj);
         System.out.println(stats);
     }
@@ -311,6 +323,7 @@ public class MPVRP {
         try {
             StringBuilder sb = new StringBuilder();
             int usedVehicles = 0;
+            int nDepots = nodeType.length - inst.nGarages - inst.nRequests;
 
             for (int v = 0; v < bestSucc.length; v++) {
                 int G_v = departure[v];
@@ -324,7 +337,7 @@ public class MPVRP {
                 int currentProd = initProd[v];
                 double cumulativeRinse = 0.0;
 
-                visitSeq.add(String.valueOf(inst.garages[G_v - inst.nDepotProducts].id()));
+                visitSeq.add(String.valueOf(inst.garages[G_v - nDepots].id()));
                 prodSeq.add(currentProd + "(" + formatCost(0.0) + ")");
 
                 curr = bestSucc[v][curr];
@@ -332,35 +345,34 @@ public class MPVRP {
                     int type = nodeType[curr];
                     if (type == DEPOT) {
                         int prod = nodeProduct[curr];
-                        if (prod != currentProd) {
-                            cumulativeRinse += inst.changeoverCost[currentProd][prod];
-                            currentProd = prod;
-                        }
+                        cumulativeRinse += inst.changeoverCost[currentProd][prod];
+                        currentProd = prod;
 
                         double load = 0;
                         int look = bestSucc[v][curr];
                         while (look != G_v && nodeType[look] != DEPOT) {
                             if (nodeType[look] == REQUEST) {
-                                load += bestDelivered[v][look] / (double) SCALE;
+                                load += bestDelivered[v][look];
                             }
                             look = bestSucc[v][look];
                         }
-                        visitSeq.add(inst.depotProducts[curr].id() + " [" + formatNumber(load) + "]");
+                        visitSeq.add(inst.depotProducts[curr / DEPOT_VISIT_COPIES].id()
+                                + " [" + formatNumber(load) + "]");
                         prodSeq.add(currentProd + "(" + formatCost(cumulativeRinse) + ")");
                     } else if (type == REQUEST) {
-                        int reqIdx = curr - inst.nDepotProducts - inst.nGarages;
-                        double deliv = bestDelivered[v][curr] / (double) SCALE;
+                        int reqIdx = curr - nDepots - inst.nGarages;
+                        double deliv = bestDelivered[v][curr];
                         visitSeq.add(inst.requests[reqIdx].id() + " (" + formatNumber(deliv) + ")");
                         prodSeq.add(currentProd + "(" + formatCost(cumulativeRinse) + ")");
                     }
                     curr = bestSucc[v][curr];
                 }
 
-                visitSeq.add(String.valueOf(inst.garages[G_v - inst.nDepotProducts].id()));
-                prodSeq.add(currentProd + "(" + formatCost(cumulativeRinse) + ")");
+                visitSeq.add(String.valueOf(inst.garages[G_v - nDepots].id()));
 
-                sb.append(v + 1).append(": ").append(String.join(" - ", visitSeq)).append("\n");
-                sb.append(v + 1).append(": ").append(String.join(" - ", prodSeq)).append("\n\n");
+                int vehicleId = inst.vehicules[v].id();
+                sb.append(vehicleId).append(": ").append(String.join(" - ", visitSeq)).append("\n");
+                sb.append(vehicleId).append(": ").append(String.join(" - ", prodSeq)).append("\n\n");
             }
 
             sb.append(usedVehicles).append("\n");
@@ -387,6 +399,11 @@ public class MPVRP {
             return Long.toString(Math.round(rounded));
         }
         return String.format(Locale.US, "%.2f", value);
+    }
+
+    private static String defaultOutputPath(String instancePath) {
+        String name = Path.of(instancePath).getFileName().toString();
+        return name.startsWith("MPVRP_") ? "Sol_" + name.substring("MPVRP_".length()) : "Sol_" + name;
     }
 
     private static String getProcessorModel() {

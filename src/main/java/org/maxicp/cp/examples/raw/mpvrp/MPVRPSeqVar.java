@@ -2,7 +2,7 @@ package org.maxicp.cp.examples.raw.mpvrp;
 
 import org.maxicp.cp.engine.constraints.Sum;
 import org.maxicp.cp.engine.constraints.seqvar.Cumulative;
-import org.maxicp.cp.engine.constraints.seqvar.Distance;
+import org.maxicp.cp.engine.core.AbstractCPConstraint;
 import org.maxicp.cp.engine.core.CPIntVar;
 import org.maxicp.cp.engine.core.CPSeqVar;
 import org.maxicp.cp.engine.core.CPSolver;
@@ -25,6 +25,7 @@ import static org.maxicp.cp.CPFactory.*;
 import static org.maxicp.modeling.algebra.sequence.SeqStatus.INSERTABLE;
 import static org.maxicp.modeling.algebra.sequence.SeqStatus.MEMBER_ORDERED;
 import static org.maxicp.search.Searches.*;
+import static org.maxicp.util.exception.InconsistencyException.INCONSISTENCY;
 
 /**
  * Multi-Product Vehicle Routing Problem with Changeover Cost
@@ -38,26 +39,64 @@ public class MPVRPSeqVar {
     private static final int NODE_DROP = 1;   // Station delivery visit
     private static final int NODE_GARAGE = 2; // Garage start/end node
 
-    /** Scaling factor to convert floating-point values to integer CP domains. */
-    private static final int SCALE = 100;
-
     /** Large penalty for invalid node transitions. */
     private static final int PENALTY_INF = 1_000_000;
 
     // Helper data structures for sequence solution export
-    private record Request(int stationId, int stationGlobal, int depotId, int depotGlobal, int product, int quantity, double rawQuantity) {}
+    private record Request(int logicalRequest, int stationId, int stationGlobal, int depotId,
+                           int depotGlobal, int product, int quantity) {}
     private record RouteSolution(String visitLine, String productLine, int productChanges, double transitionCost, double distance) {}
     private record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges, double transitionCost, double distance) {}
 
+    /** Exact route cost for arbitrary (not necessarily metric) transition matrices. */
+    private static final class RouteCost extends AbstractCPConstraint {
+        private final CPSeqVar route;
+        private final int[][] costs;
+        private final CPIntVar total;
+        private final int[] nodes;
+
+        private RouteCost(CPSeqVar route, int[][] costs, CPIntVar total) {
+            super(route.getSolver());
+            this.route = route;
+            this.costs = costs;
+            this.total = total;
+            this.nodes = new int[route.nNode()];
+        }
+
+        @Override
+        public void post() {
+            propagate();
+            route.propagateOnInsert(this);
+            route.propagateOnFix(this);
+        }
+
+        @Override
+        public void propagate() {
+            if (!route.isFixed()) {
+                return;
+            }
+            int n = route.fillNode(nodes, MEMBER_ORDERED);
+            int value = 0;
+            for (int i = 0; i < n - 1; i++) {
+                int arcCost = costs[nodes[i]][nodes[i + 1]];
+                if (arcCost >= PENALTY_INF) {
+                    throw INCONSISTENCY;
+                }
+                value += arcCost;
+            }
+            total.fix(value);
+            setActive(false);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
-        String inputFile = args.length > 0 ? args[0] : "data/MPVRPCC/inst/MPVRP_036_s5_d6_p3.dat";
+        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_013_s7_d2_p2.dat";
         String outputFile = args.length > 1 ? args[1] : null;
 
         MPVRPInstance inst = MPVRPInstance.read(inputFile);
         CPSolver cp = makeSolver();
 
         int V = inst.nVehicules;
-        int S = inst.nStations;
         int P = inst.nProds;
 
         int[] departure = new int[V];
@@ -66,11 +105,11 @@ public class MPVRPSeqVar {
         for (int v = 0; v < V; v++) {
             departure[v] = inst.vehicules[v].startG().globalId();
             initProd[v] = inst.vehicules[v].initProd(); // 0-indexed product ID
-            cap[v] = (int) Math.round(inst.vehicules[v].capacity() * SCALE);
+            cap[v] = inst.vehicules[v].capacity();
         }
 
         // Build station requests supplied by feasible depots
-        List<Request> requests = buildRequests(inst);
+        List<Request> requests = buildRequests(inst, cap);
         int R = requests.size();
         if (R == 0) {
             System.out.println("No positive station demand in the instance.");
@@ -113,16 +152,19 @@ public class MPVRPSeqVar {
         CPSeqVar[] route = new CPSeqVar[V];
         CPIntVar[] distV = new CPIntVar[V];
         CPIntVar[] loadV = new CPIntVar[V];
-        CPIntVar[] prodV = new CPIntVar[V];
 
         for (int v = 0; v < V; v++) {
             int start = 2 * R + v;
             int end = 2 * R + V + v;
             route[v] = makeSeqVar(cp, nNodes, start, end);
+            for (int other = 0; other < V; other++) {
+                if (other != v) {
+                    cp.post(exclude(route[v], 2 * R + other));
+                    cp.post(exclude(route[v], 2 * R + V + other));
+                }
+            }
             distV[v] = makeIntVar(cp, 0, maxArc * nNodes);
             loadV[v] = makeIntVar(cp, 0, totalDemand);
-            prodV[v] = makeIntVar(cp, 0, P - 1);
-            cp.post(eq(prodV[v], initProd[v]));
 
             nodeKind[start] = NODE_GARAGE;
             nodeKind[end] = NODE_GARAGE;
@@ -136,7 +178,7 @@ public class MPVRPSeqVar {
         // constraints
         for (int v = 0; v < V; v++) {
             // Traverse sequence distance and changeover cost propagation
-            cp.post(new Distance(route[v], dist, distV[v]));
+            cp.post(new RouteCost(route[v], dist, distV[v]));
 
             // Capacity constraint over pickup/drop activities
             cp.post(new Cumulative(route[v], starts, ends, load, cap[v]));
@@ -162,13 +204,29 @@ public class MPVRPSeqVar {
             cp.post(new Sum(dropVisits, 1));
         }
 
+        // Chunks of a split station-product demand must use distinct vehicles.
+        // This enforces the benchmark's at-most-once rule for each vehicle and
+        // station-product pair.
+        for (int logicalRequest = 0; logicalRequest < inst.nRequests; logicalRequest++) {
+            for (int v = 0; v < V; v++) {
+                List<CPIntVar> visits = new ArrayList<>();
+                for (int i = 0; i < R; i++) {
+                    if (requests.get(i).logicalRequest() == logicalRequest) {
+                        visits.add(route[v].getNodeVar(ends[i]).isRequired());
+                    }
+                }
+                if (visits.size() > 1) {
+                    cp.post(le(sum(visits.toArray(new CPIntVar[0])), 1));
+                }
+            }
+        }
+
         // Physical Depot Stock Constraint check
         for (int d = 0; d < inst.nDepotsRead; d++) {
             int depotId = inst.depots[d].id();
             for (int p = 0; p < P; p++) {
-                double stockVal = inst.depots[d].stocks()[p];
-                if (stockVal <= 0) continue;
-                int scaledStock = (int) Math.round(stockVal * SCALE);
+                int stock = inst.depots[d].stocks()[p];
+                if (stock <= 0) continue;
 
                 List<Integer> reqIndices = new ArrayList<>();
                 for (int i = 0; i < R; i++) {
@@ -178,7 +236,7 @@ public class MPVRPSeqVar {
                 }
                 if (!reqIndices.isEmpty()) {
                     int totalReqStock = reqIndices.stream().mapToInt(idx -> requests.get(idx).quantity()).sum();
-                    if (totalReqStock > scaledStock) {
+                    if (totalReqStock > stock) {
                         throw new IllegalArgumentException("Depot " + depotId + " stock for product " + p + " is insufficient!");
                     }
                 }
@@ -188,6 +246,7 @@ public class MPVRPSeqVar {
         // search strategy
         Integer[] routingNodes = IntStream.range(0, R).boxed().toArray(Integer[]::new);
         int[] insertions = new int[nNodes];
+        CPIntVar zero = makeIntVar(cp, 0, 0);
 
         Supplier<Runnable[]> branching = () -> {
             if (Arrays.stream(route).allMatch(CPSeqVar::isFixed)) {
@@ -199,7 +258,28 @@ public class MPVRPSeqVar {
                     n -> Arrays.stream(route).mapToInt(r -> r.nInsert(ends[n])).sum());
 
             if (node == null) {
-                return EMPTY;
+                // Propagation can require one half of a pickup/drop pair before it
+                // gets positioned. Finish any such pending insertion so that the
+                // route, and therefore the distance objective, is bound at leaves.
+                for (int pending = 0; pending < 2 * R; pending++) {
+                    int pendingNode = pending;
+                    List<Runnable> branches = new ArrayList<>();
+                    for (CPSeqVar r : route) {
+                        int nInsert = r.fillInsert(pendingNode, insertions);
+                        for (int i = 0; i < nInsert; i++) {
+                            int predecessor = insertions[i];
+                            int successor = r.memberAfter(predecessor);
+                            if (!isFeasibleInsertion(pendingNode, predecessor, successor, nodeKind, nodeProduct)) {
+                                continue;
+                            }
+                            branches.add(() -> cp.post(insert(r, predecessor, pendingNode)));
+                        }
+                    }
+                    if (!branches.isEmpty()) {
+                        return branches.toArray(new Runnable[0]);
+                    }
+                }
+                return branch(() -> cp.post(eq(zero, 1)));
             }
 
             int bestDetour = Integer.MAX_VALUE;
@@ -215,7 +295,7 @@ public class MPVRPSeqVar {
                 for (int i = 0; i < nInsert; i++) {
                     int pred = insertions[i];
                     int succ = r.memberAfter(pred);
-                    if (!isFeasibleInsertion(dropNode, pred, succ, nodeKind, nodeProduct)) {
+                    if (!isFeasiblePairInsertion(dropNode, pred, succ, nodeKind, nodeProduct)) {
                         continue;
                     }
                     int detour = dist[pred][dropNode] + dist[dropNode][succ] - dist[pred][succ];
@@ -237,12 +317,26 @@ public class MPVRPSeqVar {
                 if (nInsert == 0) {
                     return EMPTY;
                 }
-                int pred = insertions[0];
-                int succ = fallbackRoute.memberAfter(pred);
+                int pred = -1;
+                int succ = -1;
+                for (int i = 0; i < nInsert; i++) {
+                    int candidatePred = insertions[i];
+                    int candidateSucc = fallbackRoute.memberAfter(candidatePred);
+                    if (isFeasiblePairInsertion(dropNode, candidatePred, candidateSucc, nodeKind, nodeProduct)) {
+                        pred = candidatePred;
+                        succ = candidateSucc;
+                        break;
+                    }
+                }
+                if (pred == -1) {
+                    return branch(() -> cp.post(eq(zero, 1)));
+                }
+                int selectedPred = pred;
+                int selectedSucc = succ;
                 return branch(() -> {
-                    cp.post(insert(fallbackRoute, pred, pickupNode));
+                    cp.post(insert(fallbackRoute, selectedPred, pickupNode));
                     cp.post(insert(fallbackRoute, pickupNode, dropNode));
-                }, () -> cp.post(notBetween(fallbackRoute, pred, dropNode, succ)));
+                }, () -> cp.post(notBetween(fallbackRoute, selectedPred, dropNode, selectedSucc)));
             }
 
             CPSeqVar chosen = bestRoute;
@@ -266,11 +360,11 @@ public class MPVRPSeqVar {
             if (objectiveValue < bestObjective[0]) {
                 bestObjective[0] = objectiveValue;
                 bestSolution[0] = captureSolution(inst, requests, route, initProd, nNodes, R);
-                System.out.println("Solution found! Objective: " + (objectiveValue / (double) SCALE));
+                System.out.println("Solution found! Objective: " + objectiveValue);
                 long elapsedMs = System.currentTimeMillis() - init;
                 if (bestSolution[0] != null) {
                     String text = buildSolutionText(bestSolution[0], elapsedMs / 1000.0);
-                    Path out = Path.of(outputFile != null ? outputFile : defaultOutputPath(inst));
+                    Path out = Path.of(outputFile != null ? outputFile : defaultOutputPath(inputFile));
                     try {
                         writeSolution(out, text);
                     } catch (IOException e) {
@@ -301,44 +395,60 @@ public class MPVRPSeqVar {
         return true;
     }
 
-    private static List<Request> buildRequests(MPVRPInstance inst) {
-        int S = inst.nStations;
-        int D = inst.nDepots;
-        int P = inst.nProds;
+    private static boolean isFeasiblePairInsertion(int drop, int pred, int succ,
+                                                    int[] nodeKind, int[] nodeProduct) {
+        return nodeKind[pred] != NODE_PICKUP
+                && (nodeKind[succ] != NODE_DROP || nodeProduct[succ] == nodeProduct[drop]);
+    }
 
-        int[][] stock = new int[D][P];
-        for (int d = 0; d < D; d++) {
-            for (int p = 0; p < P; p++) {
-                stock[d][p] = (int) Math.round(inst.depots[d].stocks()[p] * SCALE);
-            }
-        }
+    private static List<Request> buildRequests(MPVRPInstance inst, int[] capacities) {
+        int[] remainingStock = Arrays.stream(inst.depotProducts)
+                .mapToInt(MPVRPInstance.DepotProductNode::stock)
+                .toArray();
+        int[] sortedCapacities = capacities.clone();
+        Arrays.sort(sortedCapacities);
 
         List<Request> requests = new ArrayList<>();
-        for (int s = 0; s < S; s++) {
-            int stationGlobal = inst.stations[s].id();
-            for (int p = 0; p < P; p++) {
-                int qty = (int) Math.round(inst.stations[s].demand()[p] * SCALE);
-                if (qty <= 0) {
-                    continue;
-                }
+        for (int requestIndex = 0; requestIndex < inst.nRequests; requestIndex++) {
+            MPVRPInstance.RequestNode request = inst.requests[requestIndex];
+            int nVehicles = 0;
+            int availableCapacity = 0;
+            while (nVehicles < sortedCapacities.length && availableCapacity < request.demand()) {
+                availableCapacity += sortedCapacities[sortedCapacities.length - 1 - nVehicles];
+                nVehicles++;
+            }
+            if (availableCapacity < request.demand()) {
+                throw new IllegalArgumentException("Fleet capacity is insufficient for station " + request.id()
+                        + " and product " + request.product());
+            }
+
+            int remainingDemand = request.demand();
+            int firstCapacity = sortedCapacities.length - nVehicles;
+            for (int c = firstCapacity; c < sortedCapacities.length; c++) {
+                int quantity = Math.min(sortedCapacities[c], remainingDemand);
+                remainingDemand -= quantity;
+
                 int bestDepot = -1;
-                double bestDist = Double.POSITIVE_INFINITY;
-                for (int d = 0; d < D; d++) {
-                    if (stock[d][p] < qty) {
+                int bestDistance = Integer.MAX_VALUE;
+                for (int d = 0; d < inst.nDepotProducts; d++) {
+                    MPVRPInstance.DepotProductNode depot = inst.depotProducts[d];
+                    if (depot.product() != request.product() || remainingStock[d] < quantity) {
                         continue;
                     }
-                    int depotGlobal = inst.depots[d].id();
-                    double dsd = inst.distMatrix[depotGlobal][stationGlobal];
-                    if (dsd < bestDist) {
-                        bestDist = dsd;
+                    int distance = inst.distMatrix[depot.globalId()][request.globalId()];
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
                         bestDepot = d;
                     }
                 }
                 if (bestDepot == -1) {
-                    throw new IllegalArgumentException("No depot can supply station " + s + " for product " + p);
+                    throw new IllegalArgumentException("No single depot can supply a " + quantity
+                            + "-unit split for station " + request.id() + " and product " + request.product());
                 }
-                stock[bestDepot][p] -= qty;
-                requests.add(new Request(inst.stations[s].id(), stationGlobal, inst.depots[bestDepot].id(), inst.depots[bestDepot].id(), p, qty, inst.stations[s].demand()[p]));
+                MPVRPInstance.DepotProductNode depot = inst.depotProducts[bestDepot];
+                remainingStock[bestDepot] -= quantity;
+                requests.add(new Request(requestIndex, request.id(), request.globalId(), depot.id(),
+                        depot.globalId(), request.product(), quantity));
             }
         }
         return requests;
@@ -380,21 +490,23 @@ public class MPVRPSeqVar {
 
                 if (node < nRequest) {
                     Request req = requests.get(node);
+                    cumulativeChangeCost += inst.changeoverCost[currentProduct][req.product()];
                     if (req.product() != currentProduct) {
-                        cumulativeChangeCost += inst.changeoverCost[currentProduct][req.product()];
-                        currentProduct = req.product();
                         productChanges++;
                     }
-                    visitParts.add(formatDepotLabel(req.depotId(), req.rawQuantity()));
+                    currentProduct = req.product();
+                    visitParts.add(formatDepotLabel(req.depotId(), req.quantity()));
                     productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
                 } else if (node < 2 * nRequest) {
                     Request req = requests.get(node - nRequest);
-                    visitParts.add(formatStationLabel(req.stationId(), req.rawQuantity()));
+                    visitParts.add(formatStationLabel(req.stationId(), req.quantity()));
                     productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
                 } else {
                     int garageId = inst.vehicules[v].startG().id();
                     visitParts.add(String.valueOf(garageId));
-                    productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
+                    if (i == 0) {
+                        productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
+                    }
                 }
             }
 
@@ -403,8 +515,8 @@ public class MPVRPSeqVar {
             totalDistance += routeDistance;
 
             routes.add(new RouteSolution(
-                    (v + 1) + ": " + String.join(" - ", visitParts),
-                    (v + 1) + ": " + String.join(" - ", productParts),
+                    inst.vehicules[v].id() + ": " + String.join(" - ", visitParts),
+                    inst.vehicules[v].id() + ": " + String.join(" - ", productParts),
                     productChanges,
                     cumulativeChangeCost,
                     routeDistance));
@@ -436,12 +548,9 @@ public class MPVRPSeqVar {
         Files.writeString(file, text);
     }
 
-    private static String defaultOutputPath(MPVRPInstance inst) {
-        return "Sol_MPVRP_" + sanitize(inst.uuid) + ".dat";
-    }
-
-    private static String sanitize(String s) {
-        return s.replaceAll("[^a-zA-Z0-9._-]+", "_");
+    private static String defaultOutputPath(String instancePath) {
+        String name = Path.of(instancePath).getFileName().toString();
+        return name.startsWith("MPVRP_") ? "Sol_" + name.substring("MPVRP_".length()) : "Sol_" + name;
     }
 
     private static String formatDepotLabel(int depotId, double qty) {
@@ -515,16 +624,24 @@ public class MPVRPSeqVar {
         int[][] arcCost = new int[nNodes][nNodes];
         for (int i = 0; i < nNodes; i++) {
             for (int j = 0; j < nNodes; j++) {
-                int base = (int) Math.round(inst.distMatrix[nodeGlobalId[i]][nodeGlobalId[j]] * SCALE);
+                int base = inst.distMatrix[nodeGlobalId[i]][nodeGlobalId[j]];
                 int setup = 0;
+
+                // A pickup represents one loading operation and must start a
+                // trip. Its paired delivery is therefore the next route node;
+                // this sequence example deliberately models one station per
+                // trip while the successor model can group several stations.
+                if (nodeKind[i] == NODE_PICKUP && j != nRequest + i) {
+                    setup += PENALTY_INF;
+                }
 
                 if (nodeKind[i] == NODE_DROP && nodeKind[j] == NODE_PICKUP) {
                     int p1 = nodeProduct[i];
                     int p2 = nodeProduct[j];
-                    setup += (int) Math.round(inst.changeoverCost[p1][p2] * SCALE);
+                    setup += inst.changeoverCost[p1][p2];
                 } else if (nodeKind[i] == NODE_GARAGE && startVehicle[i] >= 0 && nodeKind[j] == NODE_PICKUP) {
                     int v = startVehicle[i];
-                    setup += (int) Math.round(inst.changeoverCost[initProd[v]][nodeProduct[j]] * SCALE);
+                    setup += inst.changeoverCost[initProd[v]][nodeProduct[j]];
                 } else if (nodeKind[i] == NODE_DROP && nodeKind[j] == NODE_DROP && nodeProduct[i] != nodeProduct[j]) {
                     setup += PENALTY_INF; // Cannot change product between drops without visiting a depot
                 }
