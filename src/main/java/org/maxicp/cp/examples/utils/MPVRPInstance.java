@@ -96,7 +96,6 @@ public class MPVRPInstance {
         @Override public NodeType type() { return NodeType.DEPOT; }
     }
 
-    /** Reads an MPVRP-CC instance file. */
     public static MPVRPInstance read(String filename) throws IOException {
         MPVRPInstance inst = new MPVRPInstance();
         InputReader reader = new InputReader(filename);
@@ -131,7 +130,6 @@ public class MPVRPInstance {
 
         int currentGlobalId = 0;
 
-        // Physical Depots and Depot-Product Nodes
         inst.depots = new Depot[inst.nDepotsRead];
         List<DepotProductNode> depotList = new ArrayList<>();
         for (int i = 0; i < inst.nDepotsRead; i++) {

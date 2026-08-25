@@ -2,7 +2,7 @@ package org.maxicp.cp.examples.raw.mpvrp;
 
 import org.maxicp.cp.engine.constraints.Sum;
 import org.maxicp.cp.engine.constraints.seqvar.Cumulative;
-import org.maxicp.cp.engine.core.AbstractCPConstraint;
+import org.maxicp.cp.engine.constraints.seqvar.TransitionCost;
 import org.maxicp.cp.engine.core.CPIntVar;
 import org.maxicp.cp.engine.core.CPSeqVar;
 import org.maxicp.cp.engine.core.CPSolver;
@@ -25,7 +25,6 @@ import static org.maxicp.cp.CPFactory.*;
 import static org.maxicp.modeling.algebra.sequence.SeqStatus.INSERTABLE;
 import static org.maxicp.modeling.algebra.sequence.SeqStatus.MEMBER_ORDERED;
 import static org.maxicp.search.Searches.*;
-import static org.maxicp.util.exception.InconsistencyException.INCONSISTENCY;
 
 /**
  * Multi-Product Vehicle Routing Problem with Changeover Cost
@@ -47,47 +46,6 @@ public class MPVRPSeqVar {
                            int depotGlobal, int product, int quantity) {}
     private record RouteSolution(String visitLine, String productLine, int productChanges, double transitionCost, double distance) {}
     private record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges, double transitionCost, double distance) {}
-
-    /** Exact route cost for arbitrary (not necessarily metric) transition matrices. */
-    private static final class RouteCost extends AbstractCPConstraint {
-        private final CPSeqVar route;
-        private final int[][] costs;
-        private final CPIntVar total;
-        private final int[] nodes;
-
-        private RouteCost(CPSeqVar route, int[][] costs, CPIntVar total) {
-            super(route.getSolver());
-            this.route = route;
-            this.costs = costs;
-            this.total = total;
-            this.nodes = new int[route.nNode()];
-        }
-
-        @Override
-        public void post() {
-            propagate();
-            route.propagateOnInsert(this);
-            route.propagateOnFix(this);
-        }
-
-        @Override
-        public void propagate() {
-            if (!route.isFixed()) {
-                return;
-            }
-            int n = route.fillNode(nodes, MEMBER_ORDERED);
-            int value = 0;
-            for (int i = 0; i < n - 1; i++) {
-                int arcCost = costs[nodes[i]][nodes[i + 1]];
-                if (arcCost >= PENALTY_INF) {
-                    throw INCONSISTENCY;
-                }
-                value += arcCost;
-            }
-            total.fix(value);
-            setActive(false);
-        }
-    }
 
     public static void main(String[] args) throws Exception {
         String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_013_s7_d2_p2.dat";
@@ -178,7 +136,7 @@ public class MPVRPSeqVar {
         // constraints
         for (int v = 0; v < V; v++) {
             // Traverse sequence distance and changeover cost propagation
-            cp.post(new RouteCost(route[v], dist, distV[v]));
+            cp.post(new TransitionCost(route[v], dist, distV[v]));
 
             // Capacity constraint over pickup/drop activities
             cp.post(new Cumulative(route[v], starts, ends, load, cap[v]));
