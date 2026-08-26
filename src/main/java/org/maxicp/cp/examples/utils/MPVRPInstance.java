@@ -73,7 +73,33 @@ public class MPVRPInstance {
     public record Station(int id, int x, int y, int[] demand) {}
 
     /** Represents one station-product demand assigned to a supplying depot. */
-    public record Request(int logicalRequest, RequestNode station, DepotProductNode depot, int quantity) {}
+    public record Request(int logicalRequest, RequestNode station, DepotProductNode depot, int quantity) {
+        public Request {
+            if (quantity <= 0) {
+                throw new IllegalArgumentException("A delivery quantity must be positive");
+            }
+            if (station.product() != depot.product()) {
+                throw new IllegalArgumentException("A depot can only supply the requested product");
+            }
+        }
+    }
+
+    /** One loading operation followed by one or more deliveries of the same product. */
+    public record Trip(DepotProductNode depot, List<Request> deliveries) {
+        public Trip {
+            deliveries = List.copyOf(deliveries);
+            if (deliveries.isEmpty()) {
+                throw new IllegalArgumentException("A trip must contain at least one delivery");
+            }
+            if (deliveries.stream().anyMatch(delivery -> !delivery.depot().equals(depot))) {
+                throw new IllegalArgumentException("All trip deliveries must use the trip depot");
+            }
+        }
+
+        public int quantity() {
+            return deliveries.stream().mapToInt(Request::quantity).sum();
+        }
+    }
 
     /** Text and metrics captured for one vehicle route. */
     public record RouteSolution(String visitLine, String productLine, int productChanges,
@@ -256,9 +282,10 @@ public class MPVRPInstance {
         }
     }
 
-    public static SolutionData captureSolution(MPVRPInstance instance, List<Request> requests,
+    public static SolutionData captureSolution(MPVRPInstance instance, List<Trip> trips,
                                                CPSeqVar[] routes, int[] initialProducts,
-                                               int nodeCount, int requestCount) {
+                                               int nodeCount) {
+        int tripCount = trips.size();
         int[] nodes = new int[nodeCount];
         List<RouteSolution> routeSolutions = new ArrayList<>();
         int usedVehicles = 0;
@@ -281,37 +308,39 @@ public class MPVRPInstance {
             int productChanges = 0;
             double distance = 0.0;
 
-            for (int position = 0; position < memberCount; position++) {
-                int node = nodes[position];
-                int globalId = globalIdOf(node, instance, requests, vehicle, requestCount);
+            GarageNode garage = instance.vehicules[vehicle].startG();
+            int previousGlobalId = garage.globalId();
+            visits.add(String.valueOf(garage.id()));
+            products.add(formatProductLabel(currentProduct, transitionCost));
 
-                if (position > 0) {
-                    int previousNode = nodes[position - 1];
-                    int previousGlobalId = globalIdOf(previousNode, instance, requests, vehicle, requestCount);
-                    distance += instance.distMatrix[previousGlobalId][globalId];
+            for (int position = 1; position < memberCount - 1; position++) {
+                int tripNode = nodes[position];
+                if (tripNode >= tripCount) {
+                    throw new IllegalStateException("Unexpected garage node inside a vehicle route");
                 }
 
-                if (node < requestCount) {
-                    Request request = requests.get(node);
-                    transitionCost += instance.changeoverCost[currentProduct][request.depot().product()];
-                    if (request.depot().product() != currentProduct) {
-                        productChanges++;
-                    }
-                    currentProduct = request.depot().product();
-                    visits.add(formatDepotLabel(request.depot().id(), request.quantity()));
+                Trip trip = trips.get(tripNode);
+                distance += instance.distMatrix[previousGlobalId][trip.depot().globalId()];
+                transitionCost += instance.changeoverCost[currentProduct][trip.depot().product()];
+                if (trip.depot().product() != currentProduct) {
+                    productChanges++;
+                }
+                currentProduct = trip.depot().product();
+                visits.add(formatDepotLabel(trip.depot().id(), trip.quantity()));
+                products.add(formatProductLabel(currentProduct, transitionCost));
+                previousGlobalId = trip.depot().globalId();
+
+                for (Request delivery : trip.deliveries()) {
+                    int stationGlobalId = delivery.station().globalId();
+                    distance += instance.distMatrix[previousGlobalId][stationGlobalId];
+                    visits.add(formatStationLabel(delivery.station().id(), delivery.quantity()));
                     products.add(formatProductLabel(currentProduct, transitionCost));
-                } else if (node < 2 * requestCount) {
-                    Request request = requests.get(node - requestCount);
-                    visits.add(formatStationLabel(request.station().id(), request.quantity()));
-                    products.add(formatProductLabel(currentProduct, transitionCost));
-                } else {
-                    int garageId = instance.vehicules[vehicle].startG().id();
-                    visits.add(String.valueOf(garageId));
-                    if (position == 0) {
-                        products.add(formatProductLabel(currentProduct, transitionCost));
-                    }
+                    previousGlobalId = stationGlobalId;
                 }
             }
+
+            distance += instance.distMatrix[previousGlobalId][garage.globalId()];
+            visits.add(String.valueOf(garage.id()));
 
             totalProductChanges += productChanges;
             totalTransitionCost += transitionCost;
@@ -403,17 +432,6 @@ public class MPVRPInstance {
             // Fall back to the JVM system properties on platforms without /proc/cpuinfo.
         }
         return System.getProperty("os.name") + " " + System.getProperty("os.arch");
-    }
-
-    public static int globalIdOf(int node, MPVRPInstance instance, List<Request> requests,
-                                 int vehicle, int requestCount) {
-        if (node < requestCount) {
-            return requests.get(node).depot().globalId();
-        }
-        if (node < 2 * requestCount) {
-            return requests.get(node - requestCount).station().globalId();
-        }
-        return instance.vehicules[vehicle].startG().globalId();
     }
 
     /** Display summary of instance metrics. */

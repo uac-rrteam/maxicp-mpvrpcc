@@ -1,15 +1,14 @@
 package org.maxicp.cp.examples.raw.mpvrp;
 
 import org.maxicp.cp.engine.constraints.Sum;
-import org.maxicp.cp.engine.constraints.seqvar.Cumulative;
 import org.maxicp.cp.engine.constraints.seqvar.TransitionCost;
 import org.maxicp.cp.engine.core.CPIntVar;
 import org.maxicp.cp.engine.core.CPSeqVar;
 import org.maxicp.cp.engine.core.CPSolver;
 import org.maxicp.cp.examples.utils.MPVRPInstance;
-import org.maxicp.cp.examples.utils.MPVRPInstance.MPVRPNode;
 import org.maxicp.cp.examples.utils.MPVRPInstance.Request;
 import org.maxicp.cp.examples.utils.MPVRPInstance.SolutionData;
+import org.maxicp.cp.examples.utils.MPVRPInstance.Trip;
 import org.maxicp.search.DFSearch;
 import org.maxicp.search.Objective;
 import org.maxicp.search.SearchStatistics;
@@ -18,7 +17,10 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 
@@ -26,11 +28,7 @@ import static org.maxicp.cp.CPFactory.*;
 import static org.maxicp.cp.examples.utils.MPVRPInstance.buildSolutionText;
 import static org.maxicp.cp.examples.utils.MPVRPInstance.captureSolution;
 import static org.maxicp.cp.examples.utils.MPVRPInstance.defaultOutputPath;
-import static org.maxicp.cp.examples.utils.MPVRPInstance.isAllowedTransition;
 import static org.maxicp.cp.examples.utils.MPVRPInstance.writeSolution;
-import static org.maxicp.cp.examples.utils.MPVRPInstance.NodeType.DEPOT;
-import static org.maxicp.cp.examples.utils.MPVRPInstance.NodeType.GARAGE;
-import static org.maxicp.cp.examples.utils.MPVRPInstance.NodeType.STATION;
 import static org.maxicp.modeling.algebra.sequence.SeqStatus.INSERTABLE;
 import static org.maxicp.search.Searches.*;
 
@@ -45,114 +43,83 @@ public class MPVRPSeqVar {
     private static final int PENALTY_INF = 1_000_000;
 
     public static void main(String[] args) throws Exception {
-        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_011_s47_d3_p6.dat";
+        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_048_s50_d8_p6.dat";
         String outputFile = args.length > 1 ? args[1] : null;
 
-        MPVRPInstance inst = MPVRPInstance.read(inputFile);
+        MPVRPInstance instance = MPVRPInstance.read(inputFile);
         CPSolver cp = makeSolver();
 
-        int V = inst.nVehicules;
-        int P = inst.nProds;
-
-        int[] initProd = new int[V];
-        int[] cap = new int[V];
-        for (int v = 0; v < V; v++) {
-            initProd[v] = inst.vehicules[v].initProd(); // 0-indexed product ID
-            cap[v] = inst.vehicules[v].capacity();
+        int vehicleCount = instance.nVehicules;
+        int[] initialProducts = new int[vehicleCount];
+        int[] capacities = new int[vehicleCount];
+        for (int vehicle = 0; vehicle < vehicleCount; vehicle++) {
+            initialProducts[vehicle] = instance.vehicules[vehicle].initProd();
+            capacities[vehicle] = instance.vehicules[vehicle].capacity();
         }
 
-        // Build station requests supplied by feasible depots
-        List<Request> requests = buildRequests(inst, cap);
-        int R = requests.size();
-        if (R == 0) {
+        // Split demands across depots and pack compatible deliveries into trips.
+        List<Trip> trips = buildTrips(instance, capacities);
+        if (trips.isEmpty()) {
             System.out.println("No positive station demand in the instance.");
             return;
         }
+        int tripCount = trips.size();
 
-        // Total sequence nodes N = 2*R + 2*V (R pickups + R drops + V garage starts + V garage ends)
-        int nNodes = 2 * R + 2 * V;
-        int[] starts = new int[R];
-        int[] ends = new int[R];
-        int[] load = new int[R];
-
-        MPVRPNode[] nodes = new MPVRPNode[nNodes];
-        int[] startVehicle = new int[nNodes];
-        Arrays.fill(startVehicle, -1);
-
-        for (int i = 0; i < R; i++) {
-            Request req = requests.get(i);
-            starts[i] = i;              // Pickup node index
-            ends[i] = R + i;            // Drop node index
-            load[i] = req.quantity();   // Demand load
-
-            nodes[i] = req.depot();
-            nodes[R + i] = req.station();
-        }
-
-        int[][] dist = buildArcCosts(inst, nodes, startVehicle, initProd, R, V);
-        int maxArc = Arrays.stream(dist).flatMapToInt(Arrays::stream).max().orElse(10000);
-        int totalDemand = Arrays.stream(load).sum();
+        // A trip is atomic in the sequence: loading and all its deliveries cannot
+        // be separated or interleaved with another loading operation.
+        int nNodes = tripCount + 2 * vehicleCount;
+        int[][] cost = buildTripCosts(instance, trips, initialProducts, vehicleCount);
+        int maxArc = Arrays.stream(cost).flatMapToInt(Arrays::stream)
+                .filter(value -> value != PENALTY_INF).max().orElse(0);
+        int maxRouteCost = (int) Math.min(Integer.MAX_VALUE, (long) maxArc * nNodes);
 
         // decisions variables
-        CPSeqVar[] route = new CPSeqVar[V];
-        CPIntVar[] distV = new CPIntVar[V];
-        CPIntVar[] loadV = new CPIntVar[V];
+        CPSeqVar[] routes = new CPSeqVar[vehicleCount];
+        CPIntVar[] routeCosts = new CPIntVar[vehicleCount];
 
-        for (int v = 0; v < V; v++) {
-            int start = 2 * R + v;
-            int end = 2 * R + V + v;
-            route[v] = makeSeqVar(cp, nNodes, start, end);
-            for (int other = 0; other < V; other++) {
-                if (other != v) {
-                    cp.post(exclude(route[v], 2 * R + other));
-                    cp.post(exclude(route[v], 2 * R + V + other));
+        for (int vehicle = 0; vehicle < vehicleCount; vehicle++) {
+            int start = tripCount + vehicle;
+            int end = tripCount + vehicleCount + vehicle;
+            routes[vehicle] = makeSeqVar(cp, nNodes, start, end);
+            for (int other = 0; other < vehicleCount; other++) {
+                if (other != vehicle) {
+                    cp.post(exclude(routes[vehicle], tripCount + other));
+                    cp.post(exclude(routes[vehicle], tripCount + vehicleCount + other));
                 }
             }
-            distV[v] = makeIntVar(cp, 0, maxArc * nNodes);
-            loadV[v] = makeIntVar(cp, 0, totalDemand);
-
+            routeCosts[vehicle] = makeIntVar(cp, 0, maxRouteCost);
         }
 
-        CPIntVar sumDistance = sum(distV);
+        CPIntVar totalCost = sum(routeCosts);
 
         // constraints
-        for (int v = 0; v < V; v++) {
-            // Traverse sequence distance and changeover cost propagation
-            cp.post(new TransitionCost(route[v], dist, distV[v]));
-
-            // Capacity constraint over pickup/drop activities
-            cp.post(new Cumulative(route[v], starts, ends, load, cap[v]));
-
-            // Vehicle total carried load aggregation
-            CPIntVar[] servedLoad = new CPIntVar[R];
-            for (int i = 0; i < R; i++) {
-                servedLoad[i] = mul(route[v].getNodeVar(ends[i]).isRequired(), load[i]);
-            }
-            cp.post(new Sum(servedLoad, loadV[v]));
+        for (int vehicle = 0; vehicle < vehicleCount; vehicle++) {
+            cp.post(new TransitionCost(routes[vehicle], cost, routeCosts[vehicle]));
         }
 
-        // Request Coverage: each pickup & drop pair must be served by exactly 1 vehicle
-        for (int i = 0; i < R; i++) {
-            CPIntVar[] dropVisits = new CPIntVar[V];
-            CPIntVar[] pickupVisits = new CPIntVar[V];
-            for (int v = 0; v < V; v++) {
-                dropVisits[v] = route[v].getNodeVar(ends[i]).isRequired();
-                pickupVisits[v] = route[v].getNodeVar(starts[i]).isRequired();
-                // Pickup and drop must belong to the same vehicle route
-                cp.post(eq(dropVisits[v], pickupVisits[v]));
+        // Every trip is assigned to exactly one vehicle that can carry its load.
+        for (int trip = 0; trip < tripCount; trip++) {
+            CPIntVar[] tripVisits = new CPIntVar[vehicleCount];
+            for (int vehicle = 0; vehicle < vehicleCount; vehicle++) {
+                tripVisits[vehicle] = routes[vehicle].getNodeVar(trip).isRequired();
+                if (trips.get(trip).quantity() > capacities[vehicle]) {
+                    cp.post(exclude(routes[vehicle], trip));
+                }
             }
-            cp.post(new Sum(dropVisits, 1));
+            cp.post(new Sum(tripVisits, 1));
         }
 
         // Chunks of a split station-product demand must use distinct vehicles.
         // This enforces the benchmark's at-most-once rule for each vehicle and
         // station-product pair.
-        for (int logicalRequest = 0; logicalRequest < inst.nRequests; logicalRequest++) {
-            for (int v = 0; v < V; v++) {
+        for (int logicalRequest = 0; logicalRequest < instance.nRequests; logicalRequest++) {
+            int request = logicalRequest;
+            for (int vehicle = 0; vehicle < vehicleCount; vehicle++) {
                 List<CPIntVar> visits = new ArrayList<>();
-                for (int i = 0; i < R; i++) {
-                    if (requests.get(i).logicalRequest() == logicalRequest) {
-                        visits.add(route[v].getNodeVar(ends[i]).isRequired());
+                for (int trip = 0; trip < tripCount; trip++) {
+                    if (trips.get(trip).deliveries().stream()
+                            .anyMatch(delivery -> delivery.logicalRequest() == request)) {
+                        visits.add(routes[vehicle].getNodeVar(trip).isRequired());
                     }
                 }
                 if (visits.size() > 1) {
@@ -161,64 +128,21 @@ public class MPVRPSeqVar {
             }
         }
 
-        // Physical Depot Stock Constraint check
-        for (int d = 0; d < inst.nDepotsRead; d++) {
-            int depotId = inst.depots[d].id();
-            for (int p = 0; p < P; p++) {
-                int stock = inst.depots[d].stocks()[p];
-                if (stock <= 0) continue;
-
-                List<Integer> reqIndices = new ArrayList<>();
-                for (int i = 0; i < R; i++) {
-                    if (requests.get(i).depot().id() == depotId && requests.get(i).depot().product() == p) {
-                        reqIndices.add(i);
-                    }
-                }
-                if (!reqIndices.isEmpty()) {
-                    int totalReqStock = reqIndices.stream().mapToInt(idx -> requests.get(idx).quantity()).sum();
-                    if (totalReqStock > stock) {
-                        throw new IllegalArgumentException("Depot " + depotId + " stock for product " + p + " is insufficient!");
-                    }
-                }
-            }
-        }
-
         // search strategy
-        Integer[] routingNodes = IntStream.range(0, R).boxed().toArray(Integer[]::new);
+        Integer[] routingTrips = IntStream.range(0, tripCount).boxed().toArray(Integer[]::new);
         int[] insertions = new int[nNodes];
         CPIntVar zero = makeIntVar(cp, 0, 0);
 
         Supplier<Runnable[]> branching = () -> {
-            if (Arrays.stream(route).allMatch(CPSeqVar::isFixed)) {
+            if (Arrays.stream(routes).allMatch(CPSeqVar::isFixed)) {
                 return EMPTY;
             }
 
-            Integer node = selectMin(routingNodes,
-                    n -> Arrays.stream(route).anyMatch(r -> r.isNode(ends[n], INSERTABLE)),
-                    n -> Arrays.stream(route).mapToInt(r -> r.nInsert(ends[n])).sum());
+            Integer trip = selectMin(routingTrips,
+                    candidate -> Arrays.stream(routes).anyMatch(r -> r.isNode(candidate, INSERTABLE)),
+                    candidate -> Arrays.stream(routes).mapToInt(r -> r.nInsert(candidate)).sum());
 
-            if (node == null) {
-                // Propagation can require one half of a pickup/drop pair before it
-                // gets positioned. Finish any such pending insertion so that the
-                // route, and therefore the distance objective, is bound at leaves.
-                for (int pending = 0; pending < 2 * R; pending++) {
-                    int pendingNode = pending;
-                    List<Runnable> branches = new ArrayList<>();
-                    for (CPSeqVar r : route) {
-                        int nInsert = r.fillInsert(pendingNode, insertions);
-                        for (int i = 0; i < nInsert; i++) {
-                            int predecessor = insertions[i];
-                            int successor = r.memberAfter(predecessor);
-                            if (!isFeasibleInsertion(pendingNode, predecessor, successor, nodes)) {
-                                continue;
-                            }
-                            branches.add(() -> cp.post(insert(r, predecessor, pendingNode)));
-                        }
-                    }
-                    if (!branches.isEmpty()) {
-                        return branches.toArray(new Runnable[0]);
-                    }
-                }
+            if (trip == null) {
                 return branch(() -> cp.post(eq(zero, 1)));
             }
 
@@ -227,79 +151,46 @@ public class MPVRPSeqVar {
             int bestSucc = -1;
             CPSeqVar bestRoute = null;
 
-            int dropNode = ends[node];
-            int pickupNode = starts[node];
-
-            for (CPSeqVar r : route) {
-                int nInsert = r.fillInsert(dropNode, insertions);
+            for (CPSeqVar currentRoute : routes) {
+                int nInsert = currentRoute.fillInsert(trip, insertions);
                 for (int i = 0; i < nInsert; i++) {
                     int pred = insertions[i];
-                    int succ = r.memberAfter(pred);
-                    if (!isFeasiblePairInsertion(pickupNode, dropNode, pred, succ, nodes)) {
-                        continue;
-                    }
-                    int detour = dist[pred][dropNode] + dist[dropNode][succ] - dist[pred][succ];
+                    int succ = currentRoute.memberAfter(pred);
+                    int detour = cost[pred][trip] + cost[trip][succ] - cost[pred][succ];
                     if (detour < bestDetour) {
                         bestDetour = detour;
                         bestPred = pred;
                         bestSucc = succ;
-                        bestRoute = r;
+                        bestRoute = currentRoute;
                     }
                 }
             }
 
             if (bestRoute == null) {
-                CPSeqVar fallbackRoute = selectMin(route, r -> r.isNode(dropNode, INSERTABLE), CPSeqVar::nNode);
-                if (fallbackRoute == null) {
-                    return EMPTY;
-                }
-                int nInsert = fallbackRoute.fillInsert(dropNode, insertions);
-                if (nInsert == 0) {
-                    return EMPTY;
-                }
-                int pred = -1;
-                int succ = -1;
-                for (int i = 0; i < nInsert; i++) {
-                    int candidatePred = insertions[i];
-                    int candidateSucc = fallbackRoute.memberAfter(candidatePred);
-                    if (isFeasiblePairInsertion(pickupNode, dropNode, candidatePred, candidateSucc, nodes)) {
-                        pred = candidatePred;
-                        succ = candidateSucc;
-                        break;
-                    }
-                }
-                if (pred == -1) {
-                    return branch(() -> cp.post(eq(zero, 1)));
-                }
-                int selectedPred = pred;
-                int selectedSucc = succ;
-                return branch(() -> {
-                    cp.post(insert(fallbackRoute, selectedPred, pickupNode));
-                    cp.post(insert(fallbackRoute, pickupNode, dropNode));
-                }, () -> cp.post(notBetween(fallbackRoute, selectedPred, dropNode, selectedSucc)));
+                return branch(() -> cp.post(eq(zero, 1)));
             }
 
             CPSeqVar chosen = bestRoute;
             int chosenPred = bestPred;
             int chosenSucc = bestSucc;
-            return branch(() -> {
-                cp.post(insert(chosen, chosenPred, pickupNode));
-                cp.post(insert(chosen, pickupNode, dropNode));
-            }, () -> cp.post(notBetween(chosen, chosenPred, dropNode, chosenSucc)));
+            int chosenTrip = trip;
+            return branch(
+                    () -> cp.post(insert(chosen, chosenPred, chosenTrip)),
+                    () -> cp.post(notBetween(chosen, chosenPred, chosenTrip, chosenSucc)));
         };
 
         // objective function
         DFSearch search = makeDfs(cp, branching);
-        Objective objective = cp.minimize(sumDistance);
+        Objective objective = cp.minimize(totalCost);
         final SolutionData[] bestSolution = new SolutionData[1];
         final int[] bestObjective = {Integer.MAX_VALUE};
         long init = System.currentTimeMillis();
 
         search.onSolution(() -> {
-            int objectiveValue = sumDistance.min();
+            int objectiveValue = totalCost.min();
             if (objectiveValue < bestObjective[0]) {
                 bestObjective[0] = objectiveValue;
-                bestSolution[0] = captureSolution(inst, requests, route, initProd, nNodes, R);
+                bestSolution[0] = captureSolution(instance, trips, routes, initialProducts, nNodes);
                 System.out.println("Solution found! Objective: " + objectiveValue);
                 long elapsedMs = System.currentTimeMillis() - init;
                 if (bestSolution[0] != null) {
@@ -321,114 +212,181 @@ public class MPVRPSeqVar {
         System.out.println(stats);
     }
 
-    // help method
+    static List<Trip> buildTrips(MPVRPInstance instance, int[] capacities) {
+        if (capacities.length == 0 || Arrays.stream(capacities).anyMatch(capacity -> capacity <= 0)) {
+            throw new IllegalArgumentException("Vehicle capacities must be positive");
+        }
 
-    private static boolean isFeasibleInsertion(int node, int predecessor, int successor, MPVRPNode[] nodes) {
-        return isAllowedTransition(nodes[predecessor], nodes[node])
-                && isAllowedTransition(nodes[node], nodes[successor]);
-    }
-
-    private static boolean isFeasiblePairInsertion(int depot, int station, int predecessor, int successor,
-                                                    MPVRPNode[] nodes) {
-        return isAllowedTransition(nodes[predecessor], nodes[depot])
-                && isAllowedTransition(nodes[depot], nodes[station])
-                && isAllowedTransition(nodes[station], nodes[successor]);
-    }
-
-    private static List<Request> buildRequests(MPVRPInstance inst, int[] capacities) {
-        int[] remainingStock = Arrays.stream(inst.depotProducts)
+        int[] remainingStock = Arrays.stream(instance.depotProducts)
                 .mapToInt(MPVRPInstance.DepotProductNode::stock)
                 .toArray();
         int[] sortedCapacities = capacities.clone();
         Arrays.sort(sortedCapacities);
 
-        List<Request> requests = new ArrayList<>();
-        for (int requestIndex = 0; requestIndex < inst.nRequests; requestIndex++) {
-            MPVRPInstance.RequestNode request = inst.requests[requestIndex];
-            int nVehicles = 0;
-            int availableCapacity = 0;
-            while (nVehicles < sortedCapacities.length && availableCapacity < request.demand()) {
-                availableCapacity += sortedCapacities[sortedCapacities.length - 1 - nVehicles];
-                nVehicles++;
-            }
-            if (availableCapacity < request.demand()) {
-                throw new IllegalArgumentException("Fleet capacity is insufficient for station " + request.id()
-                        + " and product " + request.product());
-            }
+        Integer[] requestOrder = IntStream.range(0, instance.nRequests).boxed()
+                .sorted(Comparator.comparingInt((Integer index) -> instance.requests[index].demand()).reversed())
+                .toArray(Integer[]::new);
+        List<Request> deliveries = new ArrayList<>();
 
+        for (int requestIndex : requestOrder) {
+            MPVRPInstance.RequestNode request = instance.requests[requestIndex];
             int remainingDemand = request.demand();
-            int firstCapacity = sortedCapacities.length - nVehicles;
-            for (int c = firstCapacity; c < sortedCapacities.length; c++) {
-                int quantity = Math.min(sortedCapacities[c], remainingDemand);
-                remainingDemand -= quantity;
-
-                int bestDepot = -1;
-                int bestDistance = Integer.MAX_VALUE;
-                for (int d = 0; d < inst.nDepotProducts; d++) {
-                    MPVRPInstance.DepotProductNode depot = inst.depotProducts[d];
-                    if (depot.product() != request.product() || remainingStock[d] < quantity) {
+            for (int vehicle = sortedCapacities.length - 1; vehicle >= 0 && remainingDemand > 0; vehicle--) {
+                int vehicleCapacity = sortedCapacities[vehicle];
+                int selectedDepot = -1;
+                int selectedQuantity = 0;
+                int selectedDistance = Integer.MAX_VALUE;
+                for (int depotIndex = 0; depotIndex < instance.nDepotProducts; depotIndex++) {
+                    MPVRPInstance.DepotProductNode depot = instance.depotProducts[depotIndex];
+                    if (depot.product() != request.product() || remainingStock[depotIndex] == 0) {
                         continue;
                     }
-                    int distance = inst.distMatrix[depot.globalId()][request.globalId()];
-                    if (distance < bestDistance) {
-                        bestDistance = distance;
-                        bestDepot = d;
+                    int quantity = Math.min(remainingDemand, Math.min(vehicleCapacity, remainingStock[depotIndex]));
+                    int distance = instance.distMatrix[depot.globalId()][request.globalId()];
+                    if (quantity > selectedQuantity || quantity == selectedQuantity && distance < selectedDistance) {
+                        selectedDepot = depotIndex;
+                        selectedQuantity = quantity;
+                        selectedDistance = distance;
                     }
                 }
-                if (bestDepot == -1) {
-                    throw new IllegalArgumentException("No single depot can supply a " + quantity
-                            + "-unit split for station " + request.id() + " and product " + request.product());
+
+                if (selectedDepot == -1) {
+                    break;
                 }
-                MPVRPInstance.DepotProductNode depot = inst.depotProducts[bestDepot];
-                remainingStock[bestDepot] -= quantity;
-                requests.add(new Request(requestIndex, request, depot, quantity));
+                MPVRPInstance.DepotProductNode depot = instance.depotProducts[selectedDepot];
+                remainingStock[selectedDepot] -= selectedQuantity;
+                remainingDemand -= selectedQuantity;
+                deliveries.add(new Request(requestIndex, request, depot, selectedQuantity));
+            }
+
+            if (remainingDemand > 0) {
+                throw new IllegalArgumentException("Demand for station " + request.id() + " and product "
+                        + request.product() + " cannot be split among the available vehicles and depot stocks"
+                        + " (remaining quantity: " + remainingDemand + ")");
             }
         }
-        return requests;
+
+        int sharedTripCapacity = sortedCapacities[0];
+        deliveries.sort(Comparator.comparingInt(Request::quantity).reversed());
+        List<TripBin> bins = new ArrayList<>();
+        for (Request delivery : deliveries) {
+            TripBin selectedBin = null;
+            int smallestRemainingCapacity = Integer.MAX_VALUE;
+            for (TripBin bin : bins) {
+                int remainingCapacity = sharedTripCapacity - bin.quantity - delivery.quantity();
+                if (bin.canPack(delivery, sharedTripCapacity) && remainingCapacity < smallestRemainingCapacity) {
+                    selectedBin = bin;
+                    smallestRemainingCapacity = remainingCapacity;
+                }
+            }
+            if (selectedBin == null) {
+                selectedBin = new TripBin(delivery.depot());
+                bins.add(selectedBin);
+            }
+            selectedBin.add(delivery);
+        }
+
+        List<Trip> trips = new ArrayList<>(bins.size());
+        for (TripBin bin : bins) {
+            trips.add(new Trip(bin.depot, orderByNearestStation(instance, bin.depot, bin.deliveries)));
+        }
+        return trips;
     }
 
-    private static int[][] buildArcCosts(MPVRPInstance inst, MPVRPNode[] nodes,
-                                         int[] startVehicle, int[] initProd,
-                                         int nRequest, int nVehicle) {
-        for (int v = 0; v < nVehicle; v++) {
-            int start = 2 * nRequest + v;
-            int end = 2 * nRequest + nVehicle + v;
-            nodes[start] = inst.vehicules[v].startG();
-            nodes[end] = inst.vehicules[v].startG();
-            startVehicle[start] = v;
+    private static List<Request> orderByNearestStation(MPVRPInstance instance,
+                                                       MPVRPInstance.DepotProductNode depot,
+                                                       List<Request> deliveries) {
+        List<Request> remaining = new ArrayList<>(deliveries);
+        List<Request> ordered = new ArrayList<>(deliveries.size());
+        int currentGlobalId = depot.globalId();
+        while (!remaining.isEmpty()) {
+            int nearest = 0;
+            int nearestDistance = Integer.MAX_VALUE;
+            for (int i = 0; i < remaining.size(); i++) {
+                int distance = instance.distMatrix[currentGlobalId][remaining.get(i).station().globalId()];
+                if (distance < nearestDistance) {
+                    nearest = i;
+                    nearestDistance = distance;
+                }
+            }
+            Request delivery = remaining.remove(nearest);
+            ordered.add(delivery);
+            currentGlobalId = delivery.station().globalId();
+        }
+        return ordered;
+    }
+
+    static int[][] buildTripCosts(MPVRPInstance instance, List<Trip> trips,
+                                  int[] initialProducts, int vehicleCount) {
+        int tripCount = trips.size();
+        int nodeCount = tripCount + 2 * vehicleCount;
+        int[][] cost = new int[nodeCount][nodeCount];
+        for (int[] row : cost) {
+            Arrays.fill(row, PENALTY_INF);
         }
 
-        int nNodes = nodes.length;
-        int[][] arcCost = new int[nNodes][nNodes];
-        for (int i = 0; i < nNodes; i++) {
-            for (int j = 0; j < nNodes; j++) {
-                MPVRPNode from = nodes[i];
-                MPVRPNode to = nodes[j];
-                int base = inst.distMatrix[from.globalId()][to.globalId()];
-                int setup = 0;
+        int[] internalDistance = new int[tripCount];
+        int[] lastStation = new int[tripCount];
+        for (int trip = 0; trip < tripCount; trip++) {
+            Trip currentTrip = trips.get(trip);
+            int previous = currentTrip.depot().globalId();
+            for (Request delivery : currentTrip.deliveries()) {
+                int station = delivery.station().globalId();
+                internalDistance[trip] += instance.distMatrix[previous][station];
+                previous = station;
+            }
+            lastStation[trip] = previous;
+        }
 
-                boolean allowed = isAllowedTransition(from, to);
-
-                // A depot node represents one loading operation. Its paired
-                // station is therefore the next route node;
-                // this sequence example deliberately models one station per
-                // trip while the successor model can group several stations.
-                if (from.type() == DEPOT && j != nRequest + i) {
-                    allowed = false;
+        for (int from = 0; from < tripCount; from++) {
+            Trip fromTrip = trips.get(from);
+            for (int to = 0; to < tripCount; to++) {
+                if (from == to) {
+                    continue;
                 }
-
-                if (!allowed || from.type() == GARAGE && startVehicle[i] < 0) {
-                    setup += PENALTY_INF;
-                } else if (from.type() == STATION && to.type() == DEPOT) {
-                    setup += inst.changeoverCost[from.product()][to.product()];
-                } else if (from.type() == GARAGE && to.type() == DEPOT) {
-                    int v = startVehicle[i];
-                    setup += inst.changeoverCost[initProd[v]][to.product()];
-                }
-
-                arcCost[i][j] = base + setup;
+                Trip toTrip = trips.get(to);
+                cost[from][to] = instance.distMatrix[lastStation[from]][toTrip.depot().globalId()]
+                        + instance.changeoverCost[fromTrip.depot().product()][toTrip.depot().product()]
+                        + internalDistance[to];
             }
         }
-        return arcCost;
+
+        for (int vehicle = 0; vehicle < vehicleCount; vehicle++) {
+            int start = tripCount + vehicle;
+            int end = tripCount + vehicleCount + vehicle;
+            int garage = instance.vehicules[vehicle].startG().globalId();
+            cost[start][end] = 0;
+            for (int trip = 0; trip < tripCount; trip++) {
+                Trip currentTrip = trips.get(trip);
+                cost[start][trip] = instance.distMatrix[garage][currentTrip.depot().globalId()]
+                        + instance.changeoverCost[initialProducts[vehicle]][currentTrip.depot().product()]
+                        + internalDistance[trip];
+                cost[trip][end] = instance.distMatrix[lastStation[trip]][garage];
+            }
+        }
+        return cost;
+    }
+
+    private static final class TripBin {
+        private final MPVRPInstance.DepotProductNode depot;
+        private final List<Request> deliveries = new ArrayList<>();
+        private final Set<Integer> logicalRequests = new HashSet<>();
+        private int quantity;
+
+        private TripBin(MPVRPInstance.DepotProductNode depot) {
+            this.depot = depot;
+        }
+
+        private boolean canPack(Request delivery, int capacity) {
+            return depot.equals(delivery.depot())
+                    && !logicalRequests.contains(delivery.logicalRequest())
+                    && quantity + delivery.quantity() <= capacity;
+        }
+
+        private void add(Request delivery) {
+            deliveries.add(delivery);
+            logicalRequests.add(delivery.logicalRequest());
+            quantity += delivery.quantity();
+        }
     }
 }
