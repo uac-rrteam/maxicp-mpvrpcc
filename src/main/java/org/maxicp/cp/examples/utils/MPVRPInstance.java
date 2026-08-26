@@ -1,11 +1,17 @@
 package org.maxicp.cp.examples.utils;
 
+import org.maxicp.cp.engine.core.CPSeqVar;
 import org.maxicp.util.io.InputReader;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
+
+import static org.maxicp.modeling.algebra.sequence.SeqStatus.MEMBER_ORDERED;
 
 /**
  * Parser for MPVRP-CC problem instances from
@@ -65,6 +71,18 @@ public class MPVRPInstance {
 
     /** Represents a physical station with product demands. */
     public record Station(int id, int x, int y, int[] demand) {}
+
+    /** Represents one station-product demand assigned to a supplying depot. */
+    public record Request(int logicalRequest, int stationId, int stationGlobal, int depotId,
+                          int depotGlobal, int product, int quantity) {}
+
+    /** Text and metrics captured for one vehicle route. */
+    public record RouteSolution(String visitLine, String productLine, int productChanges,
+                                double transitionCost, double distance) {}
+
+    /** Complete solution data ready to be written to a file. */
+    public record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges,
+                               double transitionCost, double distance) {}
 
     /** Base interface for nodes in the execution graph. */
     public sealed interface MPVRPNode permits RequestNode, GarageNode, DepotProductNode {
@@ -212,6 +230,166 @@ public class MPVRPInstance {
                 distMatrix[i][j] = allNodes.get(i).distance(allNodes.get(j));
             }
         }
+    }
+
+    public static SolutionData captureSolution(MPVRPInstance instance, List<Request> requests,
+                                               CPSeqVar[] routes, int[] initialProducts,
+                                               int nodeCount, int requestCount) {
+        int[] nodes = new int[nodeCount];
+        List<RouteSolution> routeSolutions = new ArrayList<>();
+        int usedVehicles = 0;
+        int totalProductChanges = 0;
+        double totalTransitionCost = 0.0;
+        double totalDistance = 0.0;
+
+        for (int vehicle = 0; vehicle < routes.length; vehicle++) {
+            int memberCount = routes[vehicle].fillNode(nodes, MEMBER_ORDERED);
+            if (memberCount <= 2) {
+                continue;
+            }
+
+            usedVehicles++;
+            List<String> visits = new ArrayList<>();
+            List<String> products = new ArrayList<>();
+
+            int currentProduct = initialProducts[vehicle];
+            double transitionCost = 0.0;
+            int productChanges = 0;
+            double distance = 0.0;
+
+            for (int position = 0; position < memberCount; position++) {
+                int node = nodes[position];
+                int globalId = globalIdOf(node, instance, requests, vehicle, requestCount);
+
+                if (position > 0) {
+                    int previousNode = nodes[position - 1];
+                    int previousGlobalId = globalIdOf(previousNode, instance, requests, vehicle, requestCount);
+                    distance += instance.distMatrix[previousGlobalId][globalId];
+                }
+
+                if (node < requestCount) {
+                    Request request = requests.get(node);
+                    transitionCost += instance.changeoverCost[currentProduct][request.product()];
+                    if (request.product() != currentProduct) {
+                        productChanges++;
+                    }
+                    currentProduct = request.product();
+                    visits.add(formatDepotLabel(request.depotId(), request.quantity()));
+                    products.add(formatProductLabel(currentProduct, transitionCost));
+                } else if (node < 2 * requestCount) {
+                    Request request = requests.get(node - requestCount);
+                    visits.add(formatStationLabel(request.stationId(), request.quantity()));
+                    products.add(formatProductLabel(currentProduct, transitionCost));
+                } else {
+                    int garageId = instance.vehicules[vehicle].startG().id();
+                    visits.add(String.valueOf(garageId));
+                    if (position == 0) {
+                        products.add(formatProductLabel(currentProduct, transitionCost));
+                    }
+                }
+            }
+
+            totalProductChanges += productChanges;
+            totalTransitionCost += transitionCost;
+            totalDistance += distance;
+
+            int vehicleId = instance.vehicules[vehicle].id();
+            routeSolutions.add(new RouteSolution(
+                    vehicleId + ": " + String.join(" - ", visits),
+                    vehicleId + ": " + String.join(" - ", products),
+                    productChanges,
+                    transitionCost,
+                    distance));
+        }
+
+        return new SolutionData(routeSolutions, usedVehicles, totalProductChanges,
+                totalTransitionCost, totalDistance);
+    }
+
+    public static String buildSolutionText(SolutionData solution, double elapsedSeconds) {
+        StringBuilder text = new StringBuilder();
+        for (RouteSolution route : solution.routes()) {
+            text.append(route.visitLine()).append('\n');
+            text.append(route.productLine()).append('\n').append('\n');
+        }
+        text.append(solution.usedVehicles()).append('\n');
+        text.append(solution.productChanges()).append('\n');
+        text.append(formatCost(solution.transitionCost())).append('\n');
+        text.append(formatCost(solution.distance())).append('\n');
+        text.append(readProcessorModel()).append('\n');
+        text.append(String.format(Locale.US, "%.3f", elapsedSeconds)).append('\n');
+        return text.toString();
+    }
+
+    public static void writeSolution(Path outputFile, String solutionText) throws IOException {
+        Path outputDirectory = outputFile.toAbsolutePath().getParent();
+        if (outputDirectory != null) {
+            Files.createDirectories(outputDirectory);
+        }
+        Files.writeString(outputFile, solutionText);
+    }
+
+    public static String defaultOutputPath(String instancePath) {
+        String instanceName = Path.of(instancePath).getFileName().toString();
+        return instanceName.startsWith("MPVRP_")
+                ? "Sol_" + instanceName.substring("MPVRP_".length())
+                : "Sol_" + instanceName;
+    }
+
+    public static String formatDepotLabel(int depotId, double quantity) {
+        return depotId + " [" + formatQuantity(quantity) + "]";
+    }
+
+    public static String formatStationLabel(int stationId, double quantity) {
+        return stationId + " (" + formatQuantity(quantity) + ")";
+    }
+
+    public static String formatProductLabel(int product, double cumulativeCost) {
+        return product + "(" + formatCost(cumulativeCost) + ")";
+    }
+
+    public static String formatQuantity(double value) {
+        return formatNumber(value);
+    }
+
+    public static String formatCost(double value) {
+        return String.format(Locale.US, "%.2f", value);
+    }
+
+    public static String formatNumber(double value) {
+        double roundedValue = Math.rint(value);
+        if (Math.abs(value - roundedValue) < 1e-9) {
+            return Long.toString(Math.round(roundedValue));
+        }
+        return String.format(Locale.US, "%.2f", value);
+    }
+
+    public static String readProcessorModel() {
+        try {
+            List<String> cpuInfo = Files.readAllLines(Path.of("/proc/cpuinfo"));
+            for (String line : cpuInfo) {
+                if (line.startsWith("model name")) {
+                    int separator = line.indexOf(':');
+                    if (separator >= 0) {
+                        return line.substring(separator + 1).trim();
+                    }
+                }
+            }
+        } catch (IOException ignored) {
+            // Fall back to the JVM system properties on platforms without /proc/cpuinfo.
+        }
+        return System.getProperty("os.name") + " " + System.getProperty("os.arch");
+    }
+
+    public static int globalIdOf(int node, MPVRPInstance instance, List<Request> requests,
+                                 int vehicle, int requestCount) {
+        if (node < requestCount) {
+            return requests.get(node).depotGlobal();
+        }
+        if (node < 2 * requestCount) {
+            return requests.get(node - requestCount).stationGlobal();
+        }
+        return instance.vehicules[vehicle].startG().globalId();
     }
 
     /** Display summary of instance metrics. */

@@ -1,25 +1,40 @@
+/*
+ * MaxiCP is under MIT License
+ * Copyright (c)  2023 UCLouvain
+ */
+
 package org.maxicp.cp.engine.constraints.seqvar;
 
-import org.maxicp.cp.engine.core.AbstractCPConstraint;
 import org.maxicp.cp.engine.core.CPSeqVar;
 
-public class Last extends AbstractCPConstraint {
+import java.util.Set;
 
-    private final CPSeqVar seqVar;
-    private final int node;
-    private boolean scheduled = false;
+import static org.maxicp.cp.CPFactory.flip;
 
-    public Last(CPSeqVar seqVar, int node) {
-        super(seqVar.getSolver());
-        this.seqVar = seqVar;
-        this.node = node;
+/**
+ * Ensures that exactly one node among a set of candidates is visited last.
+ * The selected candidate is inserted immediately before the end node and all
+ * other candidates are excluded.
+ */
+public class Last extends First {
+
+    /**
+     * Creates a last-node constraint.
+     *
+     * @param seqVar sequence whose last visit is constrained
+     * @param candidates candidates for the last visited node
+     */
+    public Last(CPSeqVar seqVar, int... candidates) {
+        super(flip(seqVar), candidates);
     }
 
-    public void post() {
-        // Implementation for posting the last constraint
-    }
-
-    public void propagate() {
-        // Implementation for propagating the last constraint
+    /**
+     * Creates a last-node constraint.
+     *
+     * @param seqVar sequence whose last visit is constrained
+     * @param candidates candidates for the last visited node
+     */
+    public Last(CPSeqVar seqVar, Set<Integer> candidates) {
+        super(flip(seqVar), candidates);
     }
 }

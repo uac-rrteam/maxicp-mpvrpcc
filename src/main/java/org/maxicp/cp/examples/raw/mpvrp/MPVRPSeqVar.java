@@ -7,23 +7,26 @@ import org.maxicp.cp.engine.core.CPIntVar;
 import org.maxicp.cp.engine.core.CPSeqVar;
 import org.maxicp.cp.engine.core.CPSolver;
 import org.maxicp.cp.examples.utils.MPVRPInstance;
+import org.maxicp.cp.examples.utils.MPVRPInstance.Request;
+import org.maxicp.cp.examples.utils.MPVRPInstance.SolutionData;
 import org.maxicp.search.DFSearch;
 import org.maxicp.search.Objective;
 import org.maxicp.search.SearchStatistics;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 
 import static org.maxicp.cp.CPFactory.*;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.buildSolutionText;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.captureSolution;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.defaultOutputPath;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.writeSolution;
 import static org.maxicp.modeling.algebra.sequence.SeqStatus.INSERTABLE;
-import static org.maxicp.modeling.algebra.sequence.SeqStatus.MEMBER_ORDERED;
 import static org.maxicp.search.Searches.*;
 
 /**
@@ -40,12 +43,6 @@ public class MPVRPSeqVar {
 
     /** Large penalty for invalid node transitions. */
     private static final int PENALTY_INF = 1_000_000;
-
-    // Helper data structures for sequence solution export
-    private record Request(int logicalRequest, int stationId, int stationGlobal, int depotId,
-                           int depotGlobal, int product, int quantity) {}
-    private record RouteSolution(String visitLine, String productLine, int productChanges, double transitionCost, double distance) {}
-    private record SolutionData(List<RouteSolution> routes, int usedVehicles, int productChanges, double transitionCost, double distance) {}
 
     public static void main(String[] args) throws Exception {
         String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_086_s50_d6_p2.dat";
@@ -410,159 +407,6 @@ public class MPVRPSeqVar {
             }
         }
         return requests;
-    }
-
-    private static SolutionData captureSolution(MPVRPInstance inst, List<Request> requests, CPSeqVar[] route,
-                                                int[] initProd, int nNodes, int nRequest) {
-        int[] nodes = new int[nNodes];
-        List<RouteSolution> routes = new ArrayList<>();
-        int usedVehicles = 0;
-        int totalProductChanges = 0;
-        double totalTransitionCost = 0.0;
-        double totalDistance = 0.0;
-
-        for (int v = 0; v < route.length; v++) {
-            int nMember = route[v].fillNode(nodes, MEMBER_ORDERED);
-            if (nMember <= 2) {
-                continue;
-            }
-
-            usedVehicles++;
-            List<String> visitParts = new ArrayList<>();
-            List<String> productParts = new ArrayList<>();
-
-            int currentProduct = initProd[v];
-            double cumulativeChangeCost = 0.0;
-            int productChanges = 0;
-            double routeDistance = 0.0;
-
-            for (int i = 0; i < nMember; i++) {
-                int node = nodes[i];
-                int globalId = globalIdOf(node, inst, requests, v, nRequest);
-
-                if (i > 0) {
-                    int prev = nodes[i - 1];
-                    int prevGlobalId = globalIdOf(prev, inst, requests, v, nRequest);
-                    routeDistance += inst.distMatrix[prevGlobalId][globalId];
-                }
-
-                if (node < nRequest) {
-                    Request req = requests.get(node);
-                    cumulativeChangeCost += inst.changeoverCost[currentProduct][req.product()];
-                    if (req.product() != currentProduct) {
-                        productChanges++;
-                    }
-                    currentProduct = req.product();
-                    visitParts.add(formatDepotLabel(req.depotId(), req.quantity()));
-                    productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
-                } else if (node < 2 * nRequest) {
-                    Request req = requests.get(node - nRequest);
-                    visitParts.add(formatStationLabel(req.stationId(), req.quantity()));
-                    productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
-                } else {
-                    int garageId = inst.vehicules[v].startG().id();
-                    visitParts.add(String.valueOf(garageId));
-                    if (i == 0) {
-                        productParts.add(formatProductLabel(currentProduct, cumulativeChangeCost));
-                    }
-                }
-            }
-
-            totalProductChanges += productChanges;
-            totalTransitionCost += cumulativeChangeCost;
-            totalDistance += routeDistance;
-
-            routes.add(new RouteSolution(
-                    inst.vehicules[v].id() + ": " + String.join(" - ", visitParts),
-                    inst.vehicules[v].id() + ": " + String.join(" - ", productParts),
-                    productChanges,
-                    cumulativeChangeCost,
-                    routeDistance));
-        }
-
-        return new SolutionData(routes, usedVehicles, totalProductChanges, totalTransitionCost, totalDistance);
-    }
-
-    private static String buildSolutionText(SolutionData solution, double elapsedSeconds) {
-        StringBuilder sb = new StringBuilder();
-        for (RouteSolution route : solution.routes()) {
-            sb.append(route.visitLine()).append('\n');
-            sb.append(route.productLine()).append('\n').append('\n');
-        }
-        sb.append(solution.usedVehicles()).append('\n');
-        sb.append(solution.productChanges()).append('\n');
-        sb.append(formatCost(solution.transitionCost())).append('\n');
-        sb.append(formatCost(solution.distance())).append('\n');
-        sb.append(readProcessorModel()).append('\n');
-        sb.append(String.format(Locale.US, "%.3f", elapsedSeconds)).append('\n');
-        return sb.toString();
-    }
-
-    private static void writeSolution(Path file, String text) throws IOException {
-        Path parent = file.toAbsolutePath().getParent();
-        if (parent != null) {
-            Files.createDirectories(parent);
-        }
-        Files.writeString(file, text);
-    }
-
-    private static String defaultOutputPath(String instancePath) {
-        String name = Path.of(instancePath).getFileName().toString();
-        return name.startsWith("MPVRP_") ? "Sol_" + name.substring("MPVRP_".length()) : "Sol_" + name;
-    }
-
-    private static String formatDepotLabel(int depotId, double qty) {
-        return depotId + " [" + formatQuantity(qty) + "]";
-    }
-
-    private static String formatStationLabel(int stationId, double qty) {
-        return stationId + " (" + formatQuantity(qty) + ")";
-    }
-
-    private static String formatProductLabel(int product, double cumulativeCost) {
-        return product + "(" + formatCost(cumulativeCost) + ")";
-    }
-
-    private static String formatQuantity(double value) {
-        return formatNumber(value);
-    }
-
-    private static String formatCost(double value) {
-        return String.format(Locale.US, "%.2f", value);
-    }
-
-    private static String formatNumber(double value) {
-        double rounded = Math.rint(value);
-        if (Math.abs(value - rounded) < 1e-9) {
-            return Long.toString(Math.round(rounded));
-        }
-        return String.format(Locale.US, "%.2f", value);
-    }
-
-    private static String readProcessorModel() {
-        try {
-            List<String> lines = Files.readAllLines(Path.of("/proc/cpuinfo"));
-            for (String line : lines) {
-                if (line.startsWith("model name")) {
-                    int idx = line.indexOf(':');
-                    if (idx >= 0) {
-                        return line.substring(idx + 1).trim();
-                    }
-                }
-            }
-        } catch (IOException ignored) {
-        }
-        return System.getProperty("os.name") + " " + System.getProperty("os.arch");
-    }
-
-    private static int globalIdOf(int node, MPVRPInstance inst, List<Request> requests, int vehicle, int nRequest) {
-        if (node < nRequest) {
-            return requests.get(node).depotGlobal();
-        }
-        if (node < 2 * nRequest) {
-            return requests.get(node - nRequest).stationGlobal();
-        }
-        return inst.vehicules[vehicle].startG().globalId();
     }
 
     private static int[][] buildArcCosts(MPVRPInstance inst, int[] nodeKind, int[] nodeProduct,
