@@ -58,9 +58,9 @@ public class MPVRPInstance {
     public int[][] distMatrix;
 
     public enum NodeType {
+        DEPOT,
         STATION,
-        GARAGE,
-        DEPOT
+        GARAGE
     }
 
     /** Represents a vehicle with capacity, initial home garage, and starting product. */
@@ -73,8 +73,7 @@ public class MPVRPInstance {
     public record Station(int id, int x, int y, int[] demand) {}
 
     /** Represents one station-product demand assigned to a supplying depot. */
-    public record Request(int logicalRequest, int stationId, int stationGlobal, int depotId,
-                          int depotGlobal, int product, int quantity) {}
+    public record Request(int logicalRequest, RequestNode station, DepotProductNode depot, int quantity) {}
 
     /** Text and metrics captured for one vehicle route. */
     public record RouteSolution(String visitLine, String productLine, int productChanges,
@@ -91,6 +90,10 @@ public class MPVRPInstance {
         int x();
         int y();
         NodeType type();
+
+        default int product() {
+            return -1;
+        }
 
         default int distance(MPVRPNode o) {
             long dx = (long) this.x() - o.x();
@@ -112,6 +115,27 @@ public class MPVRPInstance {
     /** Depot-product node representing loading capability for a specific product at a depot. */
     public record DepotProductNode(int id, int globalId, int x, int y, int product, int stock) implements MPVRPNode {
         @Override public NodeType type() { return NodeType.DEPOT; }
+    }
+
+    /** Check whether an arc respects the transition rules of the MPVRP problem */
+    public static boolean isAllowedTransition(MPVRPNode from, MPVRPNode to) {
+        return switch (from.type()) {
+            case GARAGE -> to.type() == NodeType.DEPOT;
+            case DEPOT -> to.type() == NodeType.STATION && from.product() == to.product();
+            case STATION -> switch (to.type()) {
+                case GARAGE, DEPOT -> true;
+                case STATION -> from.product() == to.product();
+            };
+        };
+    }
+
+    /** Check a valid MPVRP transition and restricts garage arcs to one vehicle's home garage. */
+    public static boolean isAllowedTransition(MPVRPNode from, MPVRPNode to, GarageNode homeGarage) {
+        if (!isAllowedTransition(from, to)) {
+            return false;
+        }
+        return (from.type() != NodeType.GARAGE || from.globalId() == homeGarage.globalId())
+                && (to.type() != NodeType.GARAGE || to.globalId() == homeGarage.globalId());
     }
 
     public static MPVRPInstance read(String filename) throws IOException {
@@ -269,16 +293,16 @@ public class MPVRPInstance {
 
                 if (node < requestCount) {
                     Request request = requests.get(node);
-                    transitionCost += instance.changeoverCost[currentProduct][request.product()];
-                    if (request.product() != currentProduct) {
+                    transitionCost += instance.changeoverCost[currentProduct][request.depot().product()];
+                    if (request.depot().product() != currentProduct) {
                         productChanges++;
                     }
-                    currentProduct = request.product();
-                    visits.add(formatDepotLabel(request.depotId(), request.quantity()));
+                    currentProduct = request.depot().product();
+                    visits.add(formatDepotLabel(request.depot().id(), request.quantity()));
                     products.add(formatProductLabel(currentProduct, transitionCost));
                 } else if (node < 2 * requestCount) {
                     Request request = requests.get(node - requestCount);
-                    visits.add(formatStationLabel(request.stationId(), request.quantity()));
+                    visits.add(formatStationLabel(request.station().id(), request.quantity()));
                     products.add(formatProductLabel(currentProduct, transitionCost));
                 } else {
                     int garageId = instance.vehicules[vehicle].startG().id();
@@ -384,10 +408,10 @@ public class MPVRPInstance {
     public static int globalIdOf(int node, MPVRPInstance instance, List<Request> requests,
                                  int vehicle, int requestCount) {
         if (node < requestCount) {
-            return requests.get(node).depotGlobal();
+            return requests.get(node).depot().globalId();
         }
         if (node < 2 * requestCount) {
-            return requests.get(node - requestCount).stationGlobal();
+            return requests.get(node - requestCount).station().globalId();
         }
         return instance.vehicules[vehicle].startG().globalId();
     }

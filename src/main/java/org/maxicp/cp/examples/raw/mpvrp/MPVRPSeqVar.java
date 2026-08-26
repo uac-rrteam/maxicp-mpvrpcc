@@ -7,6 +7,7 @@ import org.maxicp.cp.engine.core.CPIntVar;
 import org.maxicp.cp.engine.core.CPSeqVar;
 import org.maxicp.cp.engine.core.CPSolver;
 import org.maxicp.cp.examples.utils.MPVRPInstance;
+import org.maxicp.cp.examples.utils.MPVRPInstance.MPVRPNode;
 import org.maxicp.cp.examples.utils.MPVRPInstance.Request;
 import org.maxicp.cp.examples.utils.MPVRPInstance.SolutionData;
 import org.maxicp.search.DFSearch;
@@ -25,7 +26,11 @@ import static org.maxicp.cp.CPFactory.*;
 import static org.maxicp.cp.examples.utils.MPVRPInstance.buildSolutionText;
 import static org.maxicp.cp.examples.utils.MPVRPInstance.captureSolution;
 import static org.maxicp.cp.examples.utils.MPVRPInstance.defaultOutputPath;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.isAllowedTransition;
 import static org.maxicp.cp.examples.utils.MPVRPInstance.writeSolution;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.NodeType.DEPOT;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.NodeType.GARAGE;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.NodeType.STATION;
 import static org.maxicp.modeling.algebra.sequence.SeqStatus.INSERTABLE;
 import static org.maxicp.search.Searches.*;
 
@@ -36,16 +41,11 @@ import static org.maxicp.search.Searches.*;
  */
 public class MPVRPSeqVar {
 
-    // Node Kind Constants
-    private static final int NODE_PICKUP = 0; // Depot loading visit
-    private static final int NODE_DROP = 1;   // Station delivery visit
-    private static final int NODE_GARAGE = 2; // Garage start/end node
-
     /** Large penalty for invalid node transitions. */
     private static final int PENALTY_INF = 1_000_000;
 
     public static void main(String[] args) throws Exception {
-        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_086_s50_d6_p2.dat";
+        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_011_s47_d3_p6.dat";
         String outputFile = args.length > 1 ? args[1] : null;
 
         MPVRPInstance inst = MPVRPInstance.read(inputFile);
@@ -54,11 +54,9 @@ public class MPVRPSeqVar {
         int V = inst.nVehicules;
         int P = inst.nProds;
 
-        int[] departure = new int[V];
         int[] initProd = new int[V];
         int[] cap = new int[V];
         for (int v = 0; v < V; v++) {
-            departure[v] = inst.vehicules[v].startG().globalId();
             initProd[v] = inst.vehicules[v].initProd(); // 0-indexed product ID
             cap[v] = inst.vehicules[v].capacity();
         }
@@ -77,12 +75,8 @@ public class MPVRPSeqVar {
         int[] ends = new int[R];
         int[] load = new int[R];
 
-        int[] nodeKind = new int[nNodes];
-        int[] nodeProduct = new int[nNodes];
-        int[] nodeGlobalId = new int[nNodes];
+        MPVRPNode[] nodes = new MPVRPNode[nNodes];
         int[] startVehicle = new int[nNodes];
-        Arrays.fill(nodeKind, NODE_GARAGE);
-        Arrays.fill(nodeProduct, -1);
         Arrays.fill(startVehicle, -1);
 
         for (int i = 0; i < R; i++) {
@@ -91,15 +85,11 @@ public class MPVRPSeqVar {
             ends[i] = R + i;            // Drop node index
             load[i] = req.quantity();   // Demand load
 
-            nodeKind[i] = NODE_PICKUP;
-            nodeKind[R + i] = NODE_DROP;
-            nodeProduct[i] = req.product();
-            nodeProduct[R + i] = req.product();
-            nodeGlobalId[i] = req.depotGlobal();
-            nodeGlobalId[R + i] = req.stationGlobal();
+            nodes[i] = req.depot();
+            nodes[R + i] = req.station();
         }
 
-        int[][] dist = buildArcCosts(inst, nodeKind, nodeProduct, nodeGlobalId, startVehicle, initProd, departure, R, V);
+        int[][] dist = buildArcCosts(inst, nodes, startVehicle, initProd, R, V);
         int maxArc = Arrays.stream(dist).flatMapToInt(Arrays::stream).max().orElse(10000);
         int totalDemand = Arrays.stream(load).sum();
 
@@ -121,11 +111,6 @@ public class MPVRPSeqVar {
             distV[v] = makeIntVar(cp, 0, maxArc * nNodes);
             loadV[v] = makeIntVar(cp, 0, totalDemand);
 
-            nodeKind[start] = NODE_GARAGE;
-            nodeKind[end] = NODE_GARAGE;
-            nodeGlobalId[start] = departure[v];
-            nodeGlobalId[end] = departure[v];
-            startVehicle[start] = v;
         }
 
         CPIntVar sumDistance = sum(distV);
@@ -185,7 +170,7 @@ public class MPVRPSeqVar {
 
                 List<Integer> reqIndices = new ArrayList<>();
                 for (int i = 0; i < R; i++) {
-                    if (requests.get(i).depotId() == depotId && requests.get(i).product() == p) {
+                    if (requests.get(i).depot().id() == depotId && requests.get(i).depot().product() == p) {
                         reqIndices.add(i);
                     }
                 }
@@ -224,7 +209,7 @@ public class MPVRPSeqVar {
                         for (int i = 0; i < nInsert; i++) {
                             int predecessor = insertions[i];
                             int successor = r.memberAfter(predecessor);
-                            if (!isFeasibleInsertion(pendingNode, predecessor, successor, nodeKind, nodeProduct)) {
+                            if (!isFeasibleInsertion(pendingNode, predecessor, successor, nodes)) {
                                 continue;
                             }
                             branches.add(() -> cp.post(insert(r, predecessor, pendingNode)));
@@ -250,7 +235,7 @@ public class MPVRPSeqVar {
                 for (int i = 0; i < nInsert; i++) {
                     int pred = insertions[i];
                     int succ = r.memberAfter(pred);
-                    if (!isFeasiblePairInsertion(dropNode, pred, succ, nodeKind, nodeProduct)) {
+                    if (!isFeasiblePairInsertion(pickupNode, dropNode, pred, succ, nodes)) {
                         continue;
                     }
                     int detour = dist[pred][dropNode] + dist[dropNode][succ] - dist[pred][succ];
@@ -277,7 +262,7 @@ public class MPVRPSeqVar {
                 for (int i = 0; i < nInsert; i++) {
                     int candidatePred = insertions[i];
                     int candidateSucc = fallbackRoute.memberAfter(candidatePred);
-                    if (isFeasiblePairInsertion(dropNode, candidatePred, candidateSucc, nodeKind, nodeProduct)) {
+                    if (isFeasiblePairInsertion(pickupNode, dropNode, candidatePred, candidateSucc, nodes)) {
                         pred = candidatePred;
                         succ = candidateSucc;
                         break;
@@ -338,22 +323,16 @@ public class MPVRPSeqVar {
 
     // help method
 
-    private static boolean isFeasibleInsertion(int node, int pred, int succ, int[] nodeKind, int[] nodeProduct) {
-        if (nodeKind[node] == NODE_PICKUP) {
-            return nodeKind[pred] != NODE_PICKUP && nodeKind[succ] != NODE_PICKUP;
-        }
-        if (nodeKind[node] == NODE_DROP) {
-            boolean leftOk = nodeKind[pred] != NODE_DROP || nodeProduct[pred] == nodeProduct[node];
-            boolean rightOk = nodeKind[succ] != NODE_DROP || nodeProduct[succ] == nodeProduct[node];
-            return leftOk && rightOk;
-        }
-        return true;
+    private static boolean isFeasibleInsertion(int node, int predecessor, int successor, MPVRPNode[] nodes) {
+        return isAllowedTransition(nodes[predecessor], nodes[node])
+                && isAllowedTransition(nodes[node], nodes[successor]);
     }
 
-    private static boolean isFeasiblePairInsertion(int drop, int pred, int succ,
-                                                    int[] nodeKind, int[] nodeProduct) {
-        return nodeKind[pred] != NODE_PICKUP
-                && (nodeKind[succ] != NODE_DROP || nodeProduct[succ] == nodeProduct[drop]);
+    private static boolean isFeasiblePairInsertion(int depot, int station, int predecessor, int successor,
+                                                    MPVRPNode[] nodes) {
+        return isAllowedTransition(nodes[predecessor], nodes[depot])
+                && isAllowedTransition(nodes[depot], nodes[station])
+                && isAllowedTransition(nodes[station], nodes[successor]);
     }
 
     private static List<Request> buildRequests(MPVRPInstance inst, int[] capacities) {
@@ -402,50 +381,49 @@ public class MPVRPSeqVar {
                 }
                 MPVRPInstance.DepotProductNode depot = inst.depotProducts[bestDepot];
                 remainingStock[bestDepot] -= quantity;
-                requests.add(new Request(requestIndex, request.id(), request.globalId(), depot.id(),
-                        depot.globalId(), request.product(), quantity));
+                requests.add(new Request(requestIndex, request, depot, quantity));
             }
         }
         return requests;
     }
 
-    private static int[][] buildArcCosts(MPVRPInstance inst, int[] nodeKind, int[] nodeProduct,
-                                         int[] nodeGlobalId, int[] startVehicle, int[] initProd,
-                                         int[] departure, int nRequest, int nVehicle) {
+    private static int[][] buildArcCosts(MPVRPInstance inst, MPVRPNode[] nodes,
+                                         int[] startVehicle, int[] initProd,
+                                         int nRequest, int nVehicle) {
         for (int v = 0; v < nVehicle; v++) {
             int start = 2 * nRequest + v;
             int end = 2 * nRequest + nVehicle + v;
-            nodeKind[start] = NODE_GARAGE;
-            nodeKind[end] = NODE_GARAGE;
-            nodeGlobalId[start] = departure[v];
-            nodeGlobalId[end] = departure[v];
+            nodes[start] = inst.vehicules[v].startG();
+            nodes[end] = inst.vehicules[v].startG();
             startVehicle[start] = v;
         }
 
-        int nNodes = nodeKind.length;
+        int nNodes = nodes.length;
         int[][] arcCost = new int[nNodes][nNodes];
         for (int i = 0; i < nNodes; i++) {
             for (int j = 0; j < nNodes; j++) {
-                int base = inst.distMatrix[nodeGlobalId[i]][nodeGlobalId[j]];
+                MPVRPNode from = nodes[i];
+                MPVRPNode to = nodes[j];
+                int base = inst.distMatrix[from.globalId()][to.globalId()];
                 int setup = 0;
 
-                // A pickup represents one loading operation and must start a
-                // trip. Its paired delivery is therefore the next route node;
+                boolean allowed = isAllowedTransition(from, to);
+
+                // A depot node represents one loading operation. Its paired
+                // station is therefore the next route node;
                 // this sequence example deliberately models one station per
                 // trip while the successor model can group several stations.
-                if (nodeKind[i] == NODE_PICKUP && j != nRequest + i) {
-                    setup += PENALTY_INF;
+                if (from.type() == DEPOT && j != nRequest + i) {
+                    allowed = false;
                 }
 
-                if (nodeKind[i] == NODE_DROP && nodeKind[j] == NODE_PICKUP) {
-                    int p1 = nodeProduct[i];
-                    int p2 = nodeProduct[j];
-                    setup += inst.changeoverCost[p1][p2];
-                } else if (nodeKind[i] == NODE_GARAGE && startVehicle[i] >= 0 && nodeKind[j] == NODE_PICKUP) {
+                if (!allowed || from.type() == GARAGE && startVehicle[i] < 0) {
+                    setup += PENALTY_INF;
+                } else if (from.type() == STATION && to.type() == DEPOT) {
+                    setup += inst.changeoverCost[from.product()][to.product()];
+                } else if (from.type() == GARAGE && to.type() == DEPOT) {
                     int v = startVehicle[i];
-                    setup += inst.changeoverCost[initProd[v]][nodeProduct[j]];
-                } else if (nodeKind[i] == NODE_DROP && nodeKind[j] == NODE_DROP && nodeProduct[i] != nodeProduct[j]) {
-                    setup += PENALTY_INF; // Cannot change product between drops without visiting a depot
+                    setup += inst.changeoverCost[initProd[v]][to.product()];
                 }
 
                 arcCost[i][j] = base + setup;
