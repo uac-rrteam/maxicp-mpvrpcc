@@ -43,7 +43,7 @@ public class MPVRPSeqVar {
     private static final int PENALTY_INF = 1_000_000;
 
     public static void main(String[] args) throws Exception {
-        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_048_s50_d8_p6.dat";
+        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_073_s5_d6_p3.dat";
         String outputFile = args.length > 1 ? args[1] : null;
 
         MPVRPInstance instance = MPVRPInstance.read(inputFile);
