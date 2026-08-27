@@ -5,6 +5,7 @@ import org.maxicp.cp.engine.core.CPBoolVar;
 import org.maxicp.cp.engine.core.CPIntVar;
 import org.maxicp.cp.engine.core.CPSolver;
 import org.maxicp.cp.examples.utils.MPVRPInstance;
+import org.maxicp.cp.examples.utils.MPVRPInstance.MPVRPNode;
 import org.maxicp.search.DFSearch;
 import org.maxicp.search.Objective;
 import org.maxicp.search.SearchStatistics;
@@ -19,6 +20,10 @@ import java.util.Locale;
 import java.util.function.Supplier;
 
 import static org.maxicp.cp.CPFactory.*;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.NodeType.DEPOT;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.NodeType.GARAGE;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.NodeType.STATION;
+import static org.maxicp.cp.examples.utils.MPVRPInstance.isAllowedTransition;
 import static org.maxicp.search.Searches.branch;
 import static org.maxicp.search.Searches.selectMin;
 import static org.maxicp.search.Searches.EMPTY;
@@ -29,11 +34,6 @@ import static org.maxicp.search.Searches.EMPTY;
  * @author Rosas Behoundja
  */
 public class MPVRP {
-
-    // Node Type Constants
-    private static final int GARAGE = 1;
-    private static final int DEPOT = 2;
-    private static final int REQUEST = 3;
 
     /** Local visit copies for each canonical depot-product node from the parser. */
     private static final int DEPOT_VISIT_COPIES = 3;
@@ -53,38 +53,27 @@ public class MPVRP {
         int nRequests = inst.nRequests;
         int N = nDepots + nGarages + nRequests; // Total node count in decision space
 
-        // Node metadata arrays mapped by globalId
-        int[] nodeType = new int[N];
-        int[] nodeProduct = new int[N];
-        int[] nodeDepotId = new int[N];
-        int[] nodeGlobalId = new int[N];
-        Arrays.fill(nodeDepotId, -1);
+        // Decision nodes point directly to the canonical instance nodes.
+        MPVRPNode[] nodes = new MPVRPNode[N];
 
         // Indices [0 .. nDepots - 1]: local copies of canonical Depot-Product nodes
         for (int i = 0; i < nDepots; i++) {
             MPVRPInstance.DepotProductNode depot = inst.depotProducts[i / DEPOT_VISIT_COPIES];
-            nodeType[i] = DEPOT;
-            nodeProduct[i] = depot.product();
-            nodeDepotId[i] = depot.id();
-            nodeGlobalId[i] = depot.globalId();
+            nodes[i] = depot;
         }
         // Indices [nDepots .. nDepots + nGarages - 1]: Garage nodes
         for (int i = 0; i < nGarages; i++) {
-            nodeType[nDepots + i] = GARAGE;
-            nodeProduct[nDepots + i] = -1;
-            nodeGlobalId[nDepots + i] = inst.garages[i].globalId();
+            nodes[nDepots + i] = inst.garages[i];
         }
         // Indices [nDepots + nGarages .. N - 1]: Station Request nodes
         for (int i = 0; i < nRequests; i++) {
-            nodeType[nDepots + nGarages + i] = REQUEST;
-            nodeProduct[nDepots + nGarages + i] = inst.requests[i].product();
-            nodeGlobalId[nDepots + nGarages + i] = inst.requests[i].globalId();
+            nodes[nDepots + nGarages + i] = inst.requests[i];
         }
 
         // Indicator array: 1 if node is a Request, 0 otherwise
         int[] isRequestNode = new int[N];
         for (int i = 0; i < N; i++) {
-            isRequestNode[i] = (nodeType[i] == REQUEST) ? 1 : 0;
+            isRequestNode[i] = nodes[i].type() == STATION ? 1 : 0;
         }
 
         // Vehicle fleet metadata
@@ -142,34 +131,20 @@ public class MPVRP {
                         continue;
                     }
 
-                    boolean allowed = false;
-                    int typeI = nodeType[i];
-                    int typeJ = nodeType[j];
-
-                    // Transition Domain Rules:
-                    // Garage -> Depot
-                    // Depot -> Request (same product only)
-                    // Request -> Request (same product) | Depot | Home Garage
-                    if (typeI == GARAGE && i == G_v && typeJ == DEPOT) {
-                        allowed = true;
-                    } else if (typeI == DEPOT && typeJ == REQUEST && nodeProduct[i] == nodeProduct[j]) {
-                        allowed = true;
-                    } else if (typeI == REQUEST) {
-                        if (typeJ == GARAGE && j == G_v) allowed = true;
-                        if (typeJ == DEPOT) allowed = true;
-                        if (typeJ == REQUEST && nodeProduct[i] == nodeProduct[j]) allowed = true;
-                    }
+                    MPVRPNode from = nodes[i];
+                    MPVRPNode to = nodes[j];
+                    boolean allowed = isAllowedTransition(from, to, inst.vehicules[v].startG());
 
                     if (!allowed) {
                         succ[v][i].remove(j);
                     } else {
-                        edgeDist[i][j] = inst.distMatrix[nodeGlobalId[i]][nodeGlobalId[j]];
+                        edgeDist[i][j] = inst.distMatrix[from.globalId()][to.globalId()];
                         // Every loading operation incurs its directed transition cost,
                         // including the first loading and same-product reloads.
-                        if (typeI == GARAGE && typeJ == DEPOT) {
-                            edgeRinse[i][j] = inst.changeoverCost[initProd[v]][nodeProduct[j]];
-                        } else if (typeI == REQUEST && typeJ == DEPOT) {
-                            edgeRinse[i][j] = inst.changeoverCost[nodeProduct[i]][nodeProduct[j]];
+                        if (from.type() == GARAGE && to.type() == DEPOT) {
+                            edgeRinse[i][j] = inst.changeoverCost[initProd[v]][to.product()];
+                        } else if (from.type() == STATION && to.type() == DEPOT) {
+                            edgeRinse[i][j] = inst.changeoverCost[from.product()][to.product()];
                         } else {
                             edgeRinse[i][j] = 0;
                         }
@@ -188,15 +163,15 @@ public class MPVRP {
                     cp.post(le(isVisited, homeGarageVisited));
                 }
 
-                if (nodeType[i] == GARAGE) {
+                if (nodes[i].type() == GARAGE) {
                     cp.post(eq(delivered[v][i], 0));
                     cp.post(eq(load[v][i], 0));
-                } else if (nodeType[i] == DEPOT) {
+                } else if (nodes[i].type() == DEPOT) {
                     cp.post(eq(delivered[v][i], 0));
                     // Depot load is 0 if unvisited, and >= 1 if visited
                     cp.post(le(load[v][i], mul(isVisited, cap[v])));
                     cp.post(ge(load[v][i], isVisited));
-                } else if (nodeType[i] == REQUEST) {
+                } else if (nodes[i].type() == STATION) {
                     // Delivery bounds: 0 if unvisited, >= 1 if visited (no empty visits)
                     cp.post(le(delivered[v][i], mul(isVisited, cap[v])));
                     cp.post(ge(delivered[v][i], isVisited));
@@ -234,7 +209,7 @@ public class MPVRP {
 
                 List<CPIntVar> depotLoads = new ArrayList<>();
                 for (int i = 0; i < nDepots; i++) {
-                    if (nodeDepotId[i] == depotId && nodeProduct[i] == p) {
+                    if (nodes[i].id() == depotId && nodes[i].product() == p) {
                         for (int v = 0; v < V; v++) {
                             depotLoads.add(load[v][i]);
                         }
@@ -293,8 +268,8 @@ public class MPVRP {
                 int currentProd = initProd[v];
                 curr = bestSucc[v][curr];
                 while (curr != G_v) {
-                    if (nodeType[curr] == DEPOT) {
-                        int prod = nodeProduct[curr];
+                    if (nodes[curr].type() == DEPOT) {
+                        int prod = nodes[curr].product();
                         if (prod != currentProd) {
                             changes++;
                             currentProd = prod;
@@ -307,7 +282,8 @@ public class MPVRP {
             System.out.println("Solution found! Objective: " + objectiveVar.min());
 
             double elapsed = (System.currentTimeMillis() - t0) / 1000.0;
-            writeSolution(outputPath, inst, bestSucc, bestDeliv, bestRinse[0], bestDist[0], bestChanges[0], elapsed, nodeType, nodeProduct, departure, initProd);
+            writeSolution(outputPath, inst, bestSucc, bestDeliv, bestRinse[0], bestDist[0],
+                    bestChanges[0], elapsed, nodes, departure, initProd);
         });
 
         System.out.println("Starting search ...");
@@ -319,11 +295,11 @@ public class MPVRP {
 
     private static void writeSolution(String filename, MPVRPInstance inst, int[][] bestSucc, int[][] bestDelivered,
                                       double totalRinse, double totalDist, int nChanges, double elapsed,
-                                      int[] nodeType, int[] nodeProduct, int[] departure, int[] initProd) {
+                                      MPVRPNode[] nodes, int[] departure, int[] initProd) {
         try {
             StringBuilder sb = new StringBuilder();
             int usedVehicles = 0;
-            int nDepots = nodeType.length - inst.nGarages - inst.nRequests;
+            int nDepots = nodes.length - inst.nGarages - inst.nRequests;
 
             for (int v = 0; v < bestSucc.length; v++) {
                 int G_v = departure[v];
@@ -342,27 +318,24 @@ public class MPVRP {
 
                 curr = bestSucc[v][curr];
                 while (curr != G_v) {
-                    int type = nodeType[curr];
-                    if (type == DEPOT) {
-                        int prod = nodeProduct[curr];
+                    if (nodes[curr].type() == DEPOT) {
+                        int prod = nodes[curr].product();
                         cumulativeRinse += inst.changeoverCost[currentProd][prod];
                         currentProd = prod;
 
                         double load = 0;
                         int look = bestSucc[v][curr];
-                        while (look != G_v && nodeType[look] != DEPOT) {
-                            if (nodeType[look] == REQUEST) {
+                        while (look != G_v && nodes[look].type() != DEPOT) {
+                            if (nodes[look].type() == STATION) {
                                 load += bestDelivered[v][look];
                             }
                             look = bestSucc[v][look];
                         }
-                        visitSeq.add(inst.depotProducts[curr / DEPOT_VISIT_COPIES].id()
-                                + " [" + formatNumber(load) + "]");
+                        visitSeq.add(nodes[curr].id() + " [" + formatNumber(load) + "]");
                         prodSeq.add(currentProd + "(" + formatCost(cumulativeRinse) + ")");
-                    } else if (type == REQUEST) {
-                        int reqIdx = curr - nDepots - inst.nGarages;
+                    } else if (nodes[curr].type() == STATION) {
                         double deliv = bestDelivered[v][curr];
-                        visitSeq.add(inst.requests[reqIdx].id() + " (" + formatNumber(deliv) + ")");
+                        visitSeq.add(nodes[curr].id() + " (" + formatNumber(deliv) + ")");
                         prodSeq.add(currentProd + "(" + formatCost(cumulativeRinse) + ")");
                     }
                     curr = bestSucc[v][curr];

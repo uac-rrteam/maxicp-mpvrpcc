@@ -95,6 +95,9 @@ public class First extends AbstractCPConstraint {
         }
     }
 
+    /**
+     *
+     */
     private void removeNonFirstInsertionsFromCandidates() {
         int start = seqVar.start();
         for (int candidate : candidates) {
@@ -113,6 +116,10 @@ public class First extends AbstractCPConstraint {
         }
     }
 
+    /**
+     *
+     * @param selectedCandidate
+     */
     private void select(int selectedCandidate) {
         for (int candidate : candidates) {
             if (candidate != selectedCandidate) {
