@@ -23,9 +23,11 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
@@ -39,7 +41,8 @@ import static org.maxicp.modeling.algebra.sequence.SeqStatus.INSERTABLE;
 import static org.maxicp.search.Searches.*;
 
 /**
- * Multi-Product Vehicle Routing Problem with Changeover Cost (MPVRP-CC).
+ * Multi-Product Vehicle Routing Problem with Changeover Cost
+ * (<a href="https://ifri-ai-classes.github.io/MPVRP-CC">MPVRP-CC</a>).
  *
  * @author Rosas Behoundja
  */
@@ -48,9 +51,27 @@ public class MPVRPSeqVar {
     /** Cost assigned to transitions that are not allowed. */
     private static final int PENALTY_INF = 1_000_000;
 
+    /** Heuristic used to order the deliveries inside each trip. */
+    public enum TripOrdering {
+        NEAREST_NEIGHBOR,
+        TWO_OPT;
+
+        static TripOrdering parse(String value) {
+            return switch (value.toLowerCase(Locale.ROOT).replace("_", "").replace("-", "")) {
+                case "nearest", "nearestneighbor", "nn" -> NEAREST_NEIGHBOR;
+                case "2opt", "twoopt" -> TWO_OPT;
+                default -> throw new IllegalArgumentException("Unknown trip ordering '" + value
+                        + "'. Expected nearest-neighbor or 2-opt.");
+            };
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_073_s5_d6_p3.dat";
         String outputFile = args.length > 1 ? args[1] : null;
+        TripOrdering tripOrdering = args.length > 2
+                ? TripOrdering.parse(args[2])
+                : TripOrdering.NEAREST_NEIGHBOR;
 
         MPVRPInstance instance = MPVRPInstance.read(inputFile);
         int vehicleCount = instance.nVehicules;
@@ -62,7 +83,7 @@ public class MPVRPSeqVar {
         }
 
         // A trip starts at a depot and contains compatible deliveries that fit in one vehicle.
-        List<Trip> trips = buildTrips(instance, capacities);
+        List<Trip> trips = buildTrips(instance, capacities, tripOrdering);
         if (trips.isEmpty()) {
             System.out.println("No positive station demand in the instance.");
             return;
@@ -217,6 +238,7 @@ public class MPVRPSeqVar {
         });
 
         System.out.println("Starting search...");
+        System.out.println("Trip ordering: " + tripOrdering);
         SearchStatistics statistics = search.optimize(objective);
 
         System.out.println(statistics);
@@ -230,6 +252,18 @@ public class MPVRPSeqVar {
      * @return trips to assign to the vehicle routes
      */
     static List<Trip> buildTrips(MPVRPInstance instance, int[] capacities) {
+        return buildTrips(instance, capacities, TripOrdering.TWO_OPT);
+    }
+
+    /**
+     * Splits station demands into deliveries and groups compatible deliveries into trips.
+     *
+     * @param instance problem instance containing stocks and station demands
+     * @param capacities capacity of each available vehicle
+     * @param tripOrdering heuristic used to order deliveries within each trip
+     * @return trips to assign to the vehicle routes
+     */
+    static List<Trip> buildTrips(MPVRPInstance instance, int[] capacities, TripOrdering tripOrdering) {
         if (capacities.length == 0 || Arrays.stream(capacities).anyMatch(capacity -> capacity <= 0)) {
             throw new IllegalArgumentException("Vehicle capacities must be positive");
         }
@@ -306,10 +340,14 @@ public class MPVRPSeqVar {
             selectedBin.add(delivery);
         }
 
-        // Visit the closest remaining station at each step inside a trip.
+        // Order the deliveries inside each trip with the selected construction heuristic.
         List<Trip> trips = new ArrayList<>(bins.size());
         for (TripBin bin : bins) {
-            trips.add(new Trip(bin.depot, orderByNearestStation(instance, bin.depot, bin.deliveries)));
+            List<Request> orderedDeliveries = switch (tripOrdering) {
+                case NEAREST_NEIGHBOR -> orderByNearestStation(instance, bin.depot, bin.deliveries);
+                case TWO_OPT -> orderBy2Opt(instance, bin.depot, bin.deliveries);
+            };
+            trips.add(new Trip(bin.depot, orderedDeliveries));
         }
         return trips;
     }
@@ -322,9 +360,9 @@ public class MPVRPSeqVar {
      * @param deliveries deliveries to order
      * @return a new list ordered from the depot to the nearest remaining station
      */
-    private static List<Request> orderByNearestStation(MPVRPInstance instance,
-                                                       MPVRPInstance.DepotProductNode depot,
-                                                       List<Request> deliveries) {
+    static List<Request> orderByNearestStation(MPVRPInstance instance,
+                                               MPVRPInstance.DepotProductNode depot,
+                                               List<Request> deliveries) {
         List<Request> remaining = new ArrayList<>(deliveries);
         List<Request> ordered = new ArrayList<>(deliveries.size());
         int currentGlobalId = depot.globalId();
@@ -343,6 +381,67 @@ public class MPVRPSeqVar {
             currentGlobalId = delivery.station().globalId();
         }
         return ordered;
+    }
+
+    /**
+     * Improves the nearest-neighbor ordering by reversing station subsequences.
+     * The depot remains the fixed start of the open path; the final station is free to change.
+     * Full path lengths are evaluated, so this also works for asymmetric distance matrices.
+     *
+     * @param instance problem instance providing the distance matrix
+     * @param depot starting depot of the trip
+     * @param deliveries deliveries to order
+     * @return a nearest-neighbor ordering improved to a 2-opt local optimum
+     */
+    static List<Request> orderBy2Opt(MPVRPInstance instance,
+                                     MPVRPInstance.DepotProductNode depot,
+                                     List<Request> deliveries) {
+        List<Request> ordered = orderByNearestStation(instance, depot, deliveries);
+        long currentDistance = tripDistance(instance, depot, ordered);
+
+        boolean improved;
+        do {
+            improved = false;
+            long bestDistance = currentDistance;
+            int bestFrom = -1;
+            int bestTo = -1;
+
+            for (int from = 0; from < ordered.size() - 1; from++) {
+                for (int to = from + 1; to < ordered.size(); to++) {
+                    Collections.reverse(ordered.subList(from, to + 1));
+                    long candidateDistance = tripDistance(instance, depot, ordered);
+                    Collections.reverse(ordered.subList(from, to + 1));
+
+                    if (candidateDistance < bestDistance) {
+                        bestDistance = candidateDistance;
+                        bestFrom = from;
+                        bestTo = to;
+                    }
+                }
+            }
+
+            if (bestFrom >= 0) {
+                Collections.reverse(ordered.subList(bestFrom, bestTo + 1));
+                currentDistance = bestDistance;
+                improved = true;
+            }
+        } while (improved);
+
+        return ordered;
+    }
+
+    /** Returns the distance from the depot through all deliveries, without a return leg. */
+    private static long tripDistance(MPVRPInstance instance,
+                                     MPVRPInstance.DepotProductNode depot,
+                                     List<Request> deliveries) {
+        long distance = 0;
+        int previous = depot.globalId();
+        for (Request delivery : deliveries) {
+            int station = delivery.station().globalId();
+            distance += instance.distMatrix[previous][station];
+            previous = station;
+        }
+        return distance;
     }
 
     /**
