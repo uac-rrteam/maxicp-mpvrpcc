@@ -22,6 +22,7 @@ import org.maxicp.cp.examples.utils.MPVRPInstance.Vehicule;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -73,6 +74,45 @@ public class MPVRPSeqVarTest extends CPSolverTest {
 
         assertEquals(2, trips.size());
         assertTrue(trips.stream().allMatch(trip -> trip.deliveries().size() == 1));
+    }
+
+    @Test
+    public void testTwoOptImprovesNearestNeighborOpenPath() {
+        int[][] coordinates = {
+                {0, 0},  // depot
+                {0, 0},  // garage
+                {8, 2},
+                {0, 5},
+                {-7, 5},
+                {-2, 3},
+                {7, 4}
+        };
+        RequestNode[] requests = new RequestNode[5];
+        for (int request = 0; request < requests.length; request++) {
+            int globalId = request + 2;
+            requests[request] = new RequestNode(request + 1, globalId,
+                    coordinates[globalId][0], coordinates[globalId][1], 0, 1);
+        }
+        MPVRPInstance instance = instance(new int[] {10}, requests);
+        for (int from = 0; from < coordinates.length; from++) {
+            for (int to = 0; to < coordinates.length; to++) {
+                instance.distMatrix[from][to] = (int) Math.round(Math.hypot(
+                        coordinates[from][0] - coordinates[to][0],
+                        coordinates[from][1] - coordinates[to][1]));
+            }
+        }
+
+        DepotProductNode depot = instance.depotProducts[0];
+        List<Request> deliveries = java.util.stream.IntStream.range(0, requests.length)
+                .mapToObj(i -> new Request(i, requests[i], depot, 1))
+                .toList();
+        List<Request> nearest = MPVRPSeqVar.orderByNearestStation(instance, depot, deliveries);
+        List<Request> twoOpt = MPVRPSeqVar.orderBy2Opt(instance, depot, deliveries);
+
+        assertEquals(new HashSet<>(deliveries), new HashSet<>(twoOpt));
+        assertTrue(openPathDistance(instance, depot, twoOpt) < openPathDistance(instance, depot, nearest));
+        assertEquals(30, openPathDistance(instance, depot, nearest));
+        assertEquals(25, openPathDistance(instance, depot, twoOpt));
     }
 
     @Test
@@ -181,5 +221,17 @@ public class MPVRPSeqVarTest extends CPSolverTest {
             }
         }
         return instance;
+    }
+
+    private static int openPathDistance(MPVRPInstance instance, DepotProductNode depot,
+                                        List<Request> deliveries) {
+        int distance = 0;
+        int previous = depot.globalId();
+        for (Request delivery : deliveries) {
+            int station = delivery.station().globalId();
+            distance += instance.distMatrix[previous][station];
+            previous = station;
+        }
+        return distance;
     }
 }
