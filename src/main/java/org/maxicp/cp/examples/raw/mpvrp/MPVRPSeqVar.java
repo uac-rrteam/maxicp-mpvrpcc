@@ -56,6 +56,9 @@ public class MPVRPSeqVar {
         PRESERVE_LARGE_STOCKS
     }
 
+    /** Delivery together with the vehicle slot used to construct a feasible packing witness. */
+    private record AllocatedDelivery(Request request, int vehicle) {}
+
     /** Heuristic used to order the deliveries inside each trip. */
     public enum TripOrdering {
         NEAREST_NEIGHBOR,
@@ -273,19 +276,20 @@ public class MPVRPSeqVar {
             throw new IllegalArgumentException("Vehicle capacities must be positive");
         }
 
-        int[] sortedCapacities = capacities.clone();
-        Arrays.sort(sortedCapacities);
+        Integer[] vehicleOrder = IntStream.range(0, capacities.length).boxed()
+                .sorted(Comparator.comparingInt(vehicle -> capacities[vehicle]))
+                .toArray(Integer[]::new);
 
         Integer[] requestOrder = IntStream.range(0, instance.nRequests).boxed()
                 .sorted(Comparator.comparingInt((Integer index) -> instance.requests[index].demand()).reversed())
                 .toArray(Integer[]::new);
-        List<Request> deliveries = allocateDeliveries(instance, sortedCapacities,
+        List<AllocatedDelivery> deliveries = allocateDeliveries(instance, capacities, vehicleOrder,
                 requestOrder, AllocationStrategy.MAX_QUANTITY);
         if (deliveries == null) {
             // The quantity-maximizing rule can fragment the remaining depot stocks
             // even when a feasible allocation exists. Retry while preserving large
             // stocks for later requests.
-            deliveries = allocateDeliveries(instance, sortedCapacities,
+            deliveries = allocateDeliveries(instance, capacities, vehicleOrder,
                     requestOrder, AllocationStrategy.PRESERVE_LARGE_STOCKS);
         }
         if (deliveries == null) {
@@ -293,24 +297,29 @@ public class MPVRPSeqVar {
                     + "this does not prove that the MPVRP-CC instance is infeasible");
         }
 
-        int sharedTripCapacity = sortedCapacities[sortedCapacities.length - 1];
-        deliveries.sort(Comparator.comparingInt(Request::quantity).reversed());
+        deliveries.sort(Comparator.comparingInt((AllocatedDelivery delivery) -> delivery.request().quantity())
+                .reversed());
         List<TripBin> bins = new ArrayList<>();
 
-        // Best-fit packing minimizes loading operations while retaining trips that
-        // can be assigned to at least one vehicle in a heterogeneous fleet.
-        for (Request delivery : deliveries) {
+        // Pack only deliveries sharing the same construction vehicle. This retains
+        // heterogeneous capacities and provides a feasible assignment witness for
+        // all split-delivery distinct-vehicle constraints.
+        for (AllocatedDelivery allocated : deliveries) {
+            Request delivery = allocated.request();
+            int constructionVehicle = allocated.vehicle();
+            int tripCapacity = capacities[constructionVehicle];
             TripBin selectedBin = null;
             int smallestRemainingCapacity = Integer.MAX_VALUE;
             for (TripBin bin : bins) {
-                int remainingCapacity = sharedTripCapacity - bin.quantity - delivery.quantity();
-                if (bin.canPack(delivery, sharedTripCapacity) && remainingCapacity < smallestRemainingCapacity) {
+                int remainingCapacity = tripCapacity - bin.quantity - delivery.quantity();
+                if (bin.canPack(delivery, constructionVehicle, tripCapacity)
+                        && remainingCapacity < smallestRemainingCapacity) {
                     selectedBin = bin;
                     smallestRemainingCapacity = remainingCapacity;
                 }
             }
             if (selectedBin == null) {
-                selectedBin = new TripBin(delivery.depot());
+                selectedBin = new TripBin(delivery.depot(), constructionVehicle);
                 bins.add(selectedBin);
             }
             selectedBin.add(delivery);
@@ -328,21 +337,23 @@ public class MPVRPSeqVar {
         return trips;
     }
 
-    private static List<Request> allocateDeliveries(MPVRPInstance instance, int[] sortedCapacities,
-                                                    Integer[] requestOrder, AllocationStrategy strategy) {
+    private static List<AllocatedDelivery> allocateDeliveries(MPVRPInstance instance, int[] capacities,
+                                                              Integer[] vehicleOrder, Integer[] requestOrder,
+                                                              AllocationStrategy strategy) {
         int[] remainingStock = Arrays.stream(instance.depotProducts)
                 .mapToInt(MPVRPInstance.DepotProductNode::stock)
                 .toArray();
-        List<Request> deliveries = new ArrayList<>();
+        List<AllocatedDelivery> deliveries = new ArrayList<>();
 
         for (int requestIndex : requestOrder) {
             MPVRPInstance.RequestNode request = instance.requests[requestIndex];
             int remainingDemand = request.demand();
-            for (int vehicle = sortedCapacities.length - 1; vehicle >= 0 && remainingDemand > 0; vehicle--) {
-                int vehicleCapacity = sortedCapacities[vehicle];
+            for (int position = vehicleOrder.length - 1; position >= 0 && remainingDemand > 0; position--) {
+                int vehicle = vehicleOrder[position];
+                int vehicleCapacity = capacities[vehicle];
                 long remainingVehicleCapacity = 0;
-                for (int other = 0; other < vehicle; other++) {
-                    remainingVehicleCapacity += sortedCapacities[other];
+                for (int other = 0; other < position; other++) {
+                    remainingVehicleCapacity += capacities[vehicleOrder[other]];
                 }
                 int minimumQuantity = (int) Math.max(1L, remainingDemand - remainingVehicleCapacity);
                 int selectedDepot = -1;
@@ -377,7 +388,8 @@ public class MPVRPSeqVar {
                 MPVRPInstance.DepotProductNode depot = instance.depotProducts[selectedDepot];
                 remainingStock[selectedDepot] -= selectedQuantity;
                 remainingDemand -= selectedQuantity;
-                deliveries.add(new Request(requestIndex, request, depot, selectedQuantity));
+                deliveries.add(new AllocatedDelivery(
+                        new Request(requestIndex, request, depot, selectedQuantity), vehicle));
             }
 
             if (remainingDemand > 0) {
@@ -567,16 +579,19 @@ public class MPVRPSeqVar {
     /** Collects deliveries that can be performed during the same loading operation. */
     private static final class TripBin {
         private final MPVRPInstance.DepotProductNode depot;
+        private final int constructionVehicle;
         private final List<Request> deliveries = new ArrayList<>();
         private final Set<Integer> logicalRequests = new HashSet<>();
         private int quantity;
 
-        private TripBin(MPVRPInstance.DepotProductNode depot) {
+        private TripBin(MPVRPInstance.DepotProductNode depot, int constructionVehicle) {
             this.depot = depot;
+            this.constructionVehicle = constructionVehicle;
         }
 
-        private boolean canPack(Request delivery, int capacity) {
+        private boolean canPack(Request delivery, int vehicle, int capacity) {
             return depot.equals(delivery.depot())
+                    && constructionVehicle == vehicle
                     && !logicalRequests.contains(delivery.logicalRequest())
                     && quantity + delivery.quantity() <= capacity;
         }
