@@ -70,6 +70,64 @@ public class TransitionCostTest extends CPSolverTest {
 
     @ParameterizedTest
     @MethodSource("getSolver")
+    public void testNonNegativeRequiredArcRelaxationRaisesLowerBound(CPSolver cp) {
+        CPSeqVar seqVar = makeSeqVar(cp, 4, 2, 3);
+        CPIntVar total = makeIntVar(cp, 0, 100);
+        int[][] costs = {
+                {0, 7, 9, 3},
+                {7, 0, 9, 4},
+                {2, 6, 0, 8},
+                {9, 9, 9, 0}
+        };
+        seqVar.require(0);
+
+        cp.post(new TransitionCost(seqVar, costs, total));
+
+        // Start node 2 needs an outgoing arc costing at least 2, and required
+        // node 0 needs one costing at least 3.
+        assertEquals(5, total.min());
+    }
+
+    @ParameterizedTest
+    @MethodSource("getSolver")
+    public void testNonTriangularMemberArcUsesSafeShortestPathBound(CPSolver cp) {
+        CPSeqVar seqVar = makeSeqVar(cp, 3, 1, 2);
+        CPIntVar total = makeIntVar(cp, 0, 2);
+        int[][] costs = {
+                {0, 50, 1},
+                {1, 0, 100},
+                {50, 50, 0}
+        };
+
+        cp.post(new TransitionCost(seqVar, costs, total));
+
+        // The current member arc costs 100, but inserting node 0 gives 1 + 1.
+        // Using the raw current cost as a lower bound would incorrectly fail.
+        assertEquals(2, total.min());
+        seqVar.insert(seqVar.start(), 0);
+        cp.fixPoint();
+        assertEquals(2, total.min());
+        assertEquals(2, total.max());
+    }
+
+    @ParameterizedTest
+    @MethodSource("getSolver")
+    public void testObjectiveUpperBoundRemovesTooExpensiveInsertion(CPSolver cp) {
+        CPSeqVar seqVar = makeSeqVar(cp, 3, 1, 2);
+        CPIntVar total = makeIntVar(cp, 0, 10);
+        int[][] costs = {
+                {0, 20, 20},
+                {20, 0, 1},
+                {20, 20, 0}
+        };
+
+        cp.post(new TransitionCost(seqVar, costs, total));
+
+        assertFalse(seqVar.isNode(0, org.maxicp.modeling.algebra.sequence.SeqStatus.INSERTABLE));
+    }
+
+    @ParameterizedTest
+    @MethodSource("getSolver")
     public void testOrderedAsymmetricCostsAndStateRestoration(CPSolver cp) {
         CPSeqVar seqVar = makeSeqVar(cp, 5, 3, 4);
         CPIntVar total = makeIntVar(cp, -100, 100);

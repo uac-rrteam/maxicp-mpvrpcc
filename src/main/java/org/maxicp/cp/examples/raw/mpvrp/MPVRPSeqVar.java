@@ -51,6 +51,11 @@ public class MPVRPSeqVar {
     /** Cost assigned to transitions that are not allowed. */
     private static final int PENALTY_INF = 1_000_000;
 
+    private enum AllocationStrategy {
+        MAX_QUANTITY,
+        PRESERVE_LARGE_STOCKS
+    }
+
     /** Heuristic used to order the deliveries inside each trip. */
     public enum TripOrdering {
         NEAREST_NEIGHBOR,
@@ -67,11 +72,11 @@ public class MPVRPSeqVar {
     }
 
     public static void main(String[] args) throws Exception {
-        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_073_s5_d6_p3.dat";
+        String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_002_s3_d6_p3.dat";
         String outputFile = args.length > 1 ? args[1] : null;
         TripOrdering tripOrdering = args.length > 2
                 ? TripOrdering.parse(args[2])
-                : TripOrdering.NEAREST_NEIGHBOR;
+                : TripOrdering.TWO_OPT;
 
         MPVRPInstance instance = MPVRPInstance.read(inputFile);
         int vehicleCount = instance.nVehicules;
@@ -268,61 +273,32 @@ public class MPVRPSeqVar {
             throw new IllegalArgumentException("Vehicle capacities must be positive");
         }
 
-        int[] remainingStock = Arrays.stream(instance.depotProducts)
-                .mapToInt(MPVRPInstance.DepotProductNode::stock)
-                .toArray();
         int[] sortedCapacities = capacities.clone();
         Arrays.sort(sortedCapacities);
 
         Integer[] requestOrder = IntStream.range(0, instance.nRequests).boxed()
                 .sorted(Comparator.comparingInt((Integer index) -> instance.requests[index].demand()).reversed())
                 .toArray(Integer[]::new);
-        List<Request> deliveries = new ArrayList<>();
-
-        // Handle large demands first and draw each delivery from the closest suitable depot.
-        for (int requestIndex : requestOrder) {
-            MPVRPInstance.RequestNode request = instance.requests[requestIndex];
-            int remainingDemand = request.demand();
-            for (int vehicle = sortedCapacities.length - 1; vehicle >= 0 && remainingDemand > 0; vehicle--) {
-                int vehicleCapacity = sortedCapacities[vehicle];
-                int selectedDepot = -1;
-                int selectedQuantity = 0;
-                int selectedDistance = Integer.MAX_VALUE;
-                for (int depotIndex = 0; depotIndex < instance.nDepotProducts; depotIndex++) {
-                    MPVRPInstance.DepotProductNode depot = instance.depotProducts[depotIndex];
-                    if (depot.product() != request.product() || remainingStock[depotIndex] == 0) {
-                        continue;
-                    }
-                    int quantity = Math.min(remainingDemand, Math.min(vehicleCapacity, remainingStock[depotIndex]));
-                    int distance = instance.distMatrix[depot.globalId()][request.globalId()];
-                    if (quantity > selectedQuantity || quantity == selectedQuantity && distance < selectedDistance) {
-                        selectedDepot = depotIndex;
-                        selectedQuantity = quantity;
-                        selectedDistance = distance;
-                    }
-                }
-
-                if (selectedDepot == -1) {
-                    break;
-                }
-                MPVRPInstance.DepotProductNode depot = instance.depotProducts[selectedDepot];
-                remainingStock[selectedDepot] -= selectedQuantity;
-                remainingDemand -= selectedQuantity;
-                deliveries.add(new Request(requestIndex, request, depot, selectedQuantity));
-            }
-
-            if (remainingDemand > 0) {
-                throw new IllegalArgumentException("Demand for station " + request.id() + " and product "
-                        + request.product() + " cannot be split among the available vehicles and depot stocks"
-                        + " (remaining quantity: " + remainingDemand + ")");
-            }
+        List<Request> deliveries = allocateDeliveries(instance, sortedCapacities,
+                requestOrder, AllocationStrategy.MAX_QUANTITY);
+        if (deliveries == null) {
+            // The quantity-maximizing rule can fragment the remaining depot stocks
+            // even when a feasible allocation exists. Retry while preserving large
+            // stocks for later requests.
+            deliveries = allocateDeliveries(instance, sortedCapacities,
+                    requestOrder, AllocationStrategy.PRESERVE_LARGE_STOCKS);
+        }
+        if (deliveries == null) {
+            throw new IllegalArgumentException("The trip-construction heuristic could not allocate all demands; "
+                    + "this does not prove that the MPVRP-CC instance is infeasible");
         }
 
-        int sharedTripCapacity = sortedCapacities[0];
+        int sharedTripCapacity = sortedCapacities[sortedCapacities.length - 1];
         deliveries.sort(Comparator.comparingInt(Request::quantity).reversed());
         List<TripBin> bins = new ArrayList<>();
 
-        // Best-fit packing keeps the number of loading operations small.
+        // Best-fit packing minimizes loading operations while retaining trips that
+        // can be assigned to at least one vehicle in a heterogeneous fleet.
         for (Request delivery : deliveries) {
             TripBin selectedBin = null;
             int smallestRemainingCapacity = Integer.MAX_VALUE;
@@ -350,6 +326,65 @@ public class MPVRPSeqVar {
             trips.add(new Trip(bin.depot, orderedDeliveries));
         }
         return trips;
+    }
+
+    private static List<Request> allocateDeliveries(MPVRPInstance instance, int[] sortedCapacities,
+                                                    Integer[] requestOrder, AllocationStrategy strategy) {
+        int[] remainingStock = Arrays.stream(instance.depotProducts)
+                .mapToInt(MPVRPInstance.DepotProductNode::stock)
+                .toArray();
+        List<Request> deliveries = new ArrayList<>();
+
+        for (int requestIndex : requestOrder) {
+            MPVRPInstance.RequestNode request = instance.requests[requestIndex];
+            int remainingDemand = request.demand();
+            for (int vehicle = sortedCapacities.length - 1; vehicle >= 0 && remainingDemand > 0; vehicle--) {
+                int vehicleCapacity = sortedCapacities[vehicle];
+                long remainingVehicleCapacity = 0;
+                for (int other = 0; other < vehicle; other++) {
+                    remainingVehicleCapacity += sortedCapacities[other];
+                }
+                int minimumQuantity = (int) Math.max(1L, remainingDemand - remainingVehicleCapacity);
+                int selectedDepot = -1;
+                int selectedQuantity = 0;
+                int selectedDistance = Integer.MAX_VALUE;
+                int selectedStock = Integer.MAX_VALUE;
+                for (int depotIndex = 0; depotIndex < instance.nDepotProducts; depotIndex++) {
+                    MPVRPInstance.DepotProductNode depot = instance.depotProducts[depotIndex];
+                    if (depot.product() != request.product() || remainingStock[depotIndex] == 0) {
+                        continue;
+                    }
+                    int quantity = Math.min(remainingDemand, Math.min(vehicleCapacity, remainingStock[depotIndex]));
+                    if (quantity < minimumQuantity) {
+                        continue;
+                    }
+                    int distance = instance.distMatrix[depot.globalId()][request.globalId()];
+                    boolean better = strategy == AllocationStrategy.MAX_QUANTITY
+                            ? quantity > selectedQuantity || quantity == selectedQuantity && distance < selectedDistance
+                            : remainingStock[depotIndex] < selectedStock
+                                    || remainingStock[depotIndex] == selectedStock && distance < selectedDistance;
+                    if (better) {
+                        selectedDepot = depotIndex;
+                        selectedQuantity = quantity;
+                        selectedDistance = distance;
+                        selectedStock = remainingStock[depotIndex];
+                    }
+                }
+
+                if (selectedDepot == -1) {
+                    break;
+                }
+                MPVRPInstance.DepotProductNode depot = instance.depotProducts[selectedDepot];
+                remainingStock[selectedDepot] -= selectedQuantity;
+                remainingDemand -= selectedQuantity;
+                deliveries.add(new Request(requestIndex, request, depot, selectedQuantity));
+            }
+
+            if (remainingDemand > 0) {
+                return null;
+            }
+        }
+        return deliveries;
     }
 
     /**
@@ -385,8 +420,10 @@ public class MPVRPSeqVar {
 
     /**
      * Improves the nearest-neighbor ordering by reversing station subsequences.
-     * The depot remains the fixed start of the open path; the final station is free to change.
-     * Full path lengths are evaluated, so this also works for asymmetric distance matrices.
+     * The depot remains the fixed start. The construction score also includes the
+     * cheapest possible continuation from the last station to any depot or garage,
+     * avoiding an order that is locally short but leaves a very poor trip endpoint.
+     * Full path lengths are evaluated, so this also works for asymmetric matrices.
      *
      * @param instance problem instance providing the distance matrix
      * @param depot starting depot of the trip
@@ -397,7 +434,7 @@ public class MPVRPSeqVar {
                                      MPVRPInstance.DepotProductNode depot,
                                      List<Request> deliveries) {
         List<Request> ordered = orderByNearestStation(instance, depot, deliveries);
-        long currentDistance = tripDistance(instance, depot, ordered);
+        long currentDistance = tripConstructionScore(instance, depot, ordered);
 
         boolean improved;
         do {
@@ -409,7 +446,7 @@ public class MPVRPSeqVar {
             for (int from = 0; from < ordered.size() - 1; from++) {
                 for (int to = from + 1; to < ordered.size(); to++) {
                     Collections.reverse(ordered.subList(from, to + 1));
-                    long candidateDistance = tripDistance(instance, depot, ordered);
+                    long candidateDistance = tripConstructionScore(instance, depot, ordered);
                     Collections.reverse(ordered.subList(from, to + 1));
 
                     if (candidateDistance < bestDistance) {
@@ -430,16 +467,33 @@ public class MPVRPSeqVar {
         return ordered;
     }
 
-    /** Returns the distance from the depot through all deliveries, without a return leg. */
-    private static long tripDistance(MPVRPInstance instance,
-                                     MPVRPInstance.DepotProductNode depot,
-                                     List<Request> deliveries) {
+    /**
+     * Scores a trip by its internal distance and a route-independent lower bound
+     * on the connection to its next depot or final garage.
+     */
+    static long tripConstructionScore(MPVRPInstance instance,
+                                      MPVRPInstance.DepotProductNode depot,
+                                      List<Request> deliveries) {
         long distance = 0;
         int previous = depot.globalId();
         for (Request delivery : deliveries) {
             int station = delivery.station().globalId();
             distance += instance.distMatrix[previous][station];
             previous = station;
+        }
+        if (!deliveries.isEmpty()) {
+            int bestContinuation = Integer.MAX_VALUE;
+            for (MPVRPInstance.DepotProductNode candidate : instance.depotProducts) {
+                bestContinuation = Math.min(bestContinuation,
+                        instance.distMatrix[previous][candidate.globalId()]);
+            }
+            for (MPVRPInstance.GarageNode garage : instance.garages) {
+                bestContinuation = Math.min(bestContinuation,
+                        instance.distMatrix[previous][garage.globalId()]);
+            }
+            if (bestContinuation != Integer.MAX_VALUE) {
+                distance += bestContinuation;
+            }
         }
         return distance;
     }

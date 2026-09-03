@@ -26,6 +26,7 @@ import java.util.HashSet;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.maxicp.cp.CPFactory.makeSeqVar;
@@ -65,6 +66,41 @@ public class MPVRPSeqVarTest extends CPSolverTest {
     }
 
     @Test
+    public void testHeterogeneousFleetUsesLargestCapacityWhenPackingTrips() {
+        MPVRPInstance instance = instance(
+                new int[] {20},
+                new RequestNode[] {
+                        new RequestNode(1, 2, 2, 0, 0, 6),
+                        new RequestNode(2, 3, 3, 0, 0, 4)
+                });
+
+        List<Trip> trips = MPVRPSeqVar.buildTrips(instance, new int[] {5, 10});
+
+        assertEquals(1, trips.size());
+        assertEquals(10, trips.getFirst().quantity());
+    }
+
+    @Test
+    public void testStockPreservingFallbackAvoidsGreedyFalseInfeasibility() {
+        MPVRPInstance instance = instance(
+                new int[] {1, 1, 4},
+                new RequestNode[] {
+                        new RequestNode(1, 4, 2, 0, 0, 3),
+                        new RequestNode(2, 5, 3, 0, 0, 3)
+                });
+
+        List<Trip> trips = MPVRPSeqVar.buildTrips(instance, new int[] {3, 3});
+        int[] delivered = new int[2];
+        for (Trip trip : trips) {
+            for (Request delivery : trip.deliveries()) {
+                delivered[delivery.logicalRequest()] += delivery.quantity();
+            }
+        }
+
+        assertArrayEquals(new int[] {3, 3}, delivered);
+    }
+
+    @Test
     public void testOneVehicleCannotVisitSameRequestTwice() {
         MPVRPInstance instance = instance(
                 new int[] {20},
@@ -77,7 +113,7 @@ public class MPVRPSeqVarTest extends CPSolverTest {
     }
 
     @Test
-    public void testTwoOptImprovesNearestNeighborOpenPath() {
+    public void testTwoOptImprovesEndpointAwareTripScore() {
         int[][] coordinates = {
                 {0, 0},  // depot
                 {0, 0},  // garage
@@ -110,9 +146,8 @@ public class MPVRPSeqVarTest extends CPSolverTest {
         List<Request> twoOpt = MPVRPSeqVar.orderBy2Opt(instance, depot, deliveries);
 
         assertEquals(new HashSet<>(deliveries), new HashSet<>(twoOpt));
-        assertTrue(openPathDistance(instance, depot, twoOpt) < openPathDistance(instance, depot, nearest));
-        assertEquals(30, openPathDistance(instance, depot, nearest));
-        assertEquals(25, openPathDistance(instance, depot, twoOpt));
+        assertTrue(MPVRPSeqVar.tripConstructionScore(instance, depot, twoOpt)
+                < MPVRPSeqVar.tripConstructionScore(instance, depot, nearest));
     }
 
     @Test
@@ -223,15 +258,4 @@ public class MPVRPSeqVarTest extends CPSolverTest {
         return instance;
     }
 
-    private static int openPathDistance(MPVRPInstance instance, DepotProductNode depot,
-                                        List<Request> deliveries) {
-        int distance = 0;
-        int previous = depot.globalId();
-        for (Request delivery : deliveries) {
-            int station = delivery.station().globalId();
-            distance += instance.distMatrix[previous][station];
-            previous = station;
-        }
-        return distance;
-    }
 }
