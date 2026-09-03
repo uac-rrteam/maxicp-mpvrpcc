@@ -197,6 +197,28 @@ public class MPVRPSeqVarTest extends CPSolverTest {
         }
     }
 
+    @Test
+    public void testHeterogeneousPackingPreservesDistinctVehicleAssignments() throws IOException {
+        for (String filename : List.of(
+                "data/MPVRP_CC/MPVRP_003_s37_d2_p2.dat",
+                "data/MPVRP_CC/MPVRP_007_s29_d7_p3.dat",
+                "data/MPVRP_CC/MPVRP_009_s11_d6_p3.dat")) {
+            MPVRPInstance instance = MPVRPInstance.read(filename);
+            int[] capacities = Arrays.stream(instance.vehicules).mapToInt(Vehicule::capacity).toArray();
+            List<Trip> trips = MPVRPSeqVar.buildTrips(instance, capacities);
+
+            for (int request = 0; request < instance.nRequests; request++) {
+                int logicalRequest = request;
+                List<Trip> requestTrips = trips.stream()
+                        .filter(trip -> trip.deliveries().stream()
+                                .anyMatch(delivery -> delivery.logicalRequest() == logicalRequest))
+                        .toList();
+                assertTrue(hasDistinctCapacityAssignment(requestTrips, capacities, 0, new boolean[capacities.length]),
+                        () -> filename + " has no distinct vehicle assignment for request " + logicalRequest);
+            }
+        }
+    }
+
     @ParameterizedTest
     @MethodSource("getSolver")
     public void testCaptureSolutionKeepsSeveralStationsInSameTrip(CPSolver cp) {
@@ -256,6 +278,23 @@ public class MPVRPSeqVarTest extends CPSolverTest {
             }
         }
         return instance;
+    }
+
+    private static boolean hasDistinctCapacityAssignment(List<Trip> trips, int[] capacities,
+                                                         int trip, boolean[] usedVehicles) {
+        if (trip == trips.size()) {
+            return true;
+        }
+        for (int vehicle = 0; vehicle < capacities.length; vehicle++) {
+            if (!usedVehicles[vehicle] && trips.get(trip).quantity() <= capacities[vehicle]) {
+                usedVehicles[vehicle] = true;
+                if (hasDistinctCapacityAssignment(trips, capacities, trip + 1, usedVehicles)) {
+                    return true;
+                }
+                usedVehicles[vehicle] = false;
+            }
+        }
+        return false;
     }
 
 }
