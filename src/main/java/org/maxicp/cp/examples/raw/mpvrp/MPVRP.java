@@ -29,26 +29,37 @@ import static org.maxicp.search.Searches.selectMin;
 import static org.maxicp.search.Searches.EMPTY;
 
 /**
- * Multi-Product Vehicle Routing Problem with Changeover Cost (MPVRP-CC)
+ * Exact successor-variable CP model for the Multi-Product Vehicle Routing
+ * Problem with Changeover Cost (MPVRP-CC). If a time limit is supplied, the
+ * model behaves as an anytime solver; optimality is certified only when the
+ * complete search terminates.
  *
  * @author Rosas Behoundja
  */
 public class MPVRP {
 
-    /** Local visit copies for each canonical depot-product node from the parser. */
-    private static final int DEPOT_VISIT_COPIES = 3;
-
     public static void main(String[] args) throws IOException {
         String instancePath = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_030_s5_d6_p4.dat";
         String outputPath = args.length > 1 ? args[1] : defaultOutputPath(instancePath);
+        double timeLimitSeconds = args.length > 2 ? Double.parseDouble(args[2]) : Double.POSITIVE_INFINITY;
+        if (timeLimitSeconds <= 0) {
+            throw new IllegalArgumentException("The optional time limit must be positive");
+        }
         MPVRPInstance inst = MPVRPInstance.read(instancePath);
         CPSolver cp = makeSolver();
 
         int V = inst.nVehicules;
         int P = inst.nProds;
+        int maxDistance = Arrays.stream(inst.distMatrix).flatMapToInt(Arrays::stream).max().orElse(0);
+        int maxChangeover = Arrays.stream(inst.changeoverCost).flatMapToInt(Arrays::stream).max().orElse(0);
 
         int nCanonicalDepots = inst.nDepotProducts;
-        int nDepots = nCanonicalDepots * DEPOT_VISIT_COPIES;
+        int[] depotVisitCopies = depotVisitCopyCounts(inst);
+        int[] depotCopyStart = new int[nCanonicalDepots + 1];
+        for (int d = 0; d < nCanonicalDepots; d++) {
+            depotCopyStart[d + 1] = depotCopyStart[d] + depotVisitCopies[d];
+        }
+        int nDepots = depotCopyStart[nCanonicalDepots];
         int nGarages = inst.nGarages;
         int nRequests = inst.nRequests;
         int N = nDepots + nGarages + nRequests; // Total node count in decision space
@@ -56,10 +67,14 @@ public class MPVRP {
         // Decision nodes point directly to the canonical instance nodes.
         MPVRPNode[] nodes = new MPVRPNode[N];
 
-        // Indices [0 .. nDepots - 1]: local copies of canonical Depot-Product nodes
-        for (int i = 0; i < nDepots; i++) {
-            MPVRPInstance.DepotProductNode depot = inst.depotProducts[i / DEPOT_VISIT_COPIES];
-            nodes[i] = depot;
+        // Indices [0 .. nDepots - 1]: local copies of canonical Depot-Product nodes.
+        // A vehicle has at most one visit per request of a product, so the number
+        // of positive requests for that product is a valid upper bound on its
+        // number of non-empty trips. The depot stock gives another valid bound.
+        for (int d = 0; d < nCanonicalDepots; d++) {
+            for (int copy = depotCopyStart[d]; copy < depotCopyStart[d + 1]; copy++) {
+                nodes[copy] = inst.depotProducts[d];
+            }
         }
         // Indices [nDepots .. nDepots + nGarages - 1]: Garage nodes
         for (int i = 0; i < nGarages; i++) {
@@ -100,8 +115,8 @@ public class MPVRP {
             pred[v] = makeIntVarArray(cp, N, N);
             load[v] = makeIntVarArray(cp, N, cap[v] + 1);
             delivered[v] = makeIntVarArray(cp, N, cap[v] + 1);
-            distStep[v] = makeIntVarArray(cp, N, 10_000_000);
-            rinseStep[v] = makeIntVarArray(cp, N, 10_000_000);
+            distStep[v] = makeIntVarArray(cp, N, maxDistance + 1);
+            rinseStep[v] = makeIntVarArray(cp, N, maxChangeover + 1);
         }
 
         // constraints
@@ -112,6 +127,20 @@ public class MPVRP {
             cp.post(new SubCircuit(succ[v]));
             cp.post(new InversePerm(succ[v], pred[v]));
             CPBoolVar homeGarageVisited = isNeq(succ[v][G_v], G_v);
+
+            // Copies of the same depot-product node are interchangeable. Use a
+            // prefix of copies and label visited copies by increasing predecessor
+            // index. Every feasible route can be relabeled this way, so these
+            // constraints only remove symmetric representations.
+            for (int d = 0; d < nCanonicalDepots; d++) {
+                for (int copy = depotCopyStart[d] + 1; copy < depotCopyStart[d + 1]; copy++) {
+                    int previousCopy = copy - 1;
+                    CPBoolVar previousVisited = isNeq(succ[v][previousCopy], previousCopy);
+                    CPBoolVar copyVisited = isNeq(succ[v][copy], copy);
+                    cp.post(le(copyVisited, previousVisited));
+                    cp.post(le(copyVisited, isLt(pred[v][previousCopy], pred[v][copy])));
+                }
+            }
 
             // Prevent vehicle v from visiting garages belonging to other vehicles
             for (int g = nDepots; g < nDepots + nGarages; g++) {
@@ -173,8 +202,10 @@ public class MPVRP {
                     cp.post(ge(load[v][i], isVisited));
                 } else if (nodes[i].type() == STATION) {
                     // Delivery bounds: 0 if unvisited, >= 1 if visited (no empty visits)
-                    cp.post(le(delivered[v][i], mul(isVisited, cap[v])));
+                    int maxDelivery = Math.min(cap[v], ((MPVRPInstance.RequestNode) nodes[i]).demand());
+                    cp.post(le(delivered[v][i], mul(isVisited, maxDelivery)));
                     cp.post(ge(delivered[v][i], isVisited));
+                    cp.post(le(load[v][i], mul(isVisited, cap[v])));
 
                     // Load conservation along request sequence: load[v][i] + delivered[v][i] == load[v][pred[v][i]]
                     CPIntVar loadBefore = makeIntVar(cp, 0, cap[v]);
@@ -230,15 +261,31 @@ public class MPVRP {
         CPIntVar objectiveVar = sum(totalDist, totalRinse);
 
         CPIntVar[] allSuccVars = Arrays.stream(succ).flatMap(Arrays::stream).toArray(CPIntVar[]::new);
+        CPIntVar[] allDeliveryVars = new CPIntVar[V * nRequests];
+        for (int v = 0; v < V; v++) {
+            for (int r = 0; r < nRequests; r++) {
+                allDeliveryVars[v * nRequests + r] = delivered[v][nDepots + nGarages + r];
+            }
+        }
 
-        // First-fail branching on successor variables
+        // First assign split-delivery quantities, preferring concentrated loads.
+        // A zero delivery excludes the corresponding request from that vehicle,
+        // which drastically reduces the successor domains before route search.
+        // Both branches are retained, so this changes search order, not exactness.
         Supplier<Runnable[]> branching = () -> {
-            CPIntVar xs = selectMin(allSuccVars,
+            CPIntVar xs = selectMin(allDeliveryVars,
                     x -> x.size() > 1,
                     x -> x.size());
+            boolean assigningDelivery = xs != null;
+            if (xs == null) {
+                xs = selectMin(allSuccVars,
+                        x -> x.size() > 1,
+                        x -> x.size());
+            }
             if (xs == null) return EMPTY;
-            int val = xs.min();
-            return branch(() -> cp.post(eq(xs, val)), () -> cp.post(neq(xs, val)));
+            CPIntVar selected = xs;
+            int val = assigningDelivery ? selected.max() : selected.min();
+            return branch(() -> cp.post(eq(selected, val)), () -> cp.post(neq(selected, val)));
         };
 
         DFSearch search = makeDfs(cp, branching);
@@ -287,8 +334,36 @@ public class MPVRP {
         });
 
         System.out.println("Starting search ...");
-        SearchStatistics stats = search.optimize(obj);
+        SearchStatistics stats = search.optimize(obj, ignored ->
+                (System.currentTimeMillis() - t0) / 1000.0 >= timeLimitSeconds);
         System.out.println(stats);
+        if (!stats.isCompleted()) {
+            if (stats.numberOfSolutions() > 0) {
+                System.out.println("Time limit reached: the saved incumbent is feasible but optimality is not certified.");
+            } else {
+                System.out.println("Time limit reached before a feasible solution was found.");
+            }
+        }
+    }
+
+    /**
+     * Computes an exact per-vehicle upper bound on visits to every depot-product.
+     * Each non-empty visit serves at least one request of the depot's product, and
+     * a vehicle may serve a request at most once. Each visit also loads at least
+     * one unit, hence the additional stock bound.
+     */
+    static int[] depotVisitCopyCounts(MPVRPInstance inst) {
+        int[] requestsPerProduct = new int[inst.nProds];
+        for (MPVRPInstance.RequestNode request : inst.requests) {
+            requestsPerProduct[request.product()]++;
+        }
+
+        int[] copies = new int[inst.nDepotProducts];
+        for (int d = 0; d < inst.nDepotProducts; d++) {
+            MPVRPInstance.DepotProductNode depot = inst.depotProducts[d];
+            copies[d] = Math.min(requestsPerProduct[depot.product()], depot.stock());
+        }
+        return copies;
     }
 
     // help functions
@@ -355,7 +430,12 @@ public class MPVRP {
             sb.append(getProcessorModel()).append("\n");
             sb.append(String.format(Locale.US, "%.3f", elapsed)).append("\n");
 
-            Files.writeString(Path.of(filename), sb.toString());
+            Path output = Path.of(filename);
+            Path parent = output.toAbsolutePath().getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Files.writeString(output, sb.toString());
             System.out.println("Solution written to " + filename);
         } catch (Exception e) {
             e.printStackTrace();

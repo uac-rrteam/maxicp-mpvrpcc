@@ -3,6 +3,4 @@
 target/
 *.DS_Store
 
-docs-mpvrp-cc/mpvrp_seqvar_model.md
-
 .github/workflows

@@ -26,6 +26,7 @@ import java.util.HashSet;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.maxicp.cp.CPFactory.makeSeqVar;
@@ -65,6 +66,41 @@ public class MPVRPSeqVarTest extends CPSolverTest {
     }
 
     @Test
+    public void testHeterogeneousFleetUsesLargestCapacityWhenPackingTrips() {
+        MPVRPInstance instance = instance(
+                new int[] {20},
+                new RequestNode[] {
+                        new RequestNode(1, 2, 2, 0, 0, 6),
+                        new RequestNode(2, 3, 3, 0, 0, 4)
+                });
+
+        List<Trip> trips = MPVRPSeqVar.buildTrips(instance, new int[] {5, 10});
+
+        assertEquals(1, trips.size());
+        assertEquals(10, trips.getFirst().quantity());
+    }
+
+    @Test
+    public void testStockPreservingFallbackAvoidsGreedyFalseInfeasibility() {
+        MPVRPInstance instance = instance(
+                new int[] {1, 1, 4},
+                new RequestNode[] {
+                        new RequestNode(1, 4, 2, 0, 0, 3),
+                        new RequestNode(2, 5, 3, 0, 0, 3)
+                });
+
+        List<Trip> trips = MPVRPSeqVar.buildTrips(instance, new int[] {3, 3});
+        int[] delivered = new int[2];
+        for (Trip trip : trips) {
+            for (Request delivery : trip.deliveries()) {
+                delivered[delivery.logicalRequest()] += delivery.quantity();
+            }
+        }
+
+        assertArrayEquals(new int[] {3, 3}, delivered);
+    }
+
+    @Test
     public void testOneVehicleCannotVisitSameRequestTwice() {
         MPVRPInstance instance = instance(
                 new int[] {20},
@@ -77,7 +113,7 @@ public class MPVRPSeqVarTest extends CPSolverTest {
     }
 
     @Test
-    public void testTwoOptImprovesNearestNeighborOpenPath() {
+    public void testTwoOptImprovesEndpointAwareTripScore() {
         int[][] coordinates = {
                 {0, 0},  // depot
                 {0, 0},  // garage
@@ -110,9 +146,8 @@ public class MPVRPSeqVarTest extends CPSolverTest {
         List<Request> twoOpt = MPVRPSeqVar.orderBy2Opt(instance, depot, deliveries);
 
         assertEquals(new HashSet<>(deliveries), new HashSet<>(twoOpt));
-        assertTrue(openPathDistance(instance, depot, twoOpt) < openPathDistance(instance, depot, nearest));
-        assertEquals(30, openPathDistance(instance, depot, nearest));
-        assertEquals(25, openPathDistance(instance, depot, twoOpt));
+        assertTrue(MPVRPSeqVar.tripConstructionScore(instance, depot, twoOpt)
+                < MPVRPSeqVar.tripConstructionScore(instance, depot, nearest));
     }
 
     @Test
@@ -159,6 +194,28 @@ public class MPVRPSeqVarTest extends CPSolverTest {
         }
         for (int depot = 0; depot < instance.nDepotProducts; depot++) {
             assertTrue(usedStock[depot] <= instance.depotProducts[depot].stock());
+        }
+    }
+
+    @Test
+    public void testHeterogeneousPackingPreservesDistinctVehicleAssignments() throws IOException {
+        for (String filename : List.of(
+                "data/MPVRP_CC/MPVRP_003_s37_d2_p2.dat",
+                "data/MPVRP_CC/MPVRP_007_s29_d7_p3.dat",
+                "data/MPVRP_CC/MPVRP_009_s11_d6_p3.dat")) {
+            MPVRPInstance instance = MPVRPInstance.read(filename);
+            int[] capacities = Arrays.stream(instance.vehicules).mapToInt(Vehicule::capacity).toArray();
+            List<Trip> trips = MPVRPSeqVar.buildTrips(instance, capacities);
+
+            for (int request = 0; request < instance.nRequests; request++) {
+                int logicalRequest = request;
+                List<Trip> requestTrips = trips.stream()
+                        .filter(trip -> trip.deliveries().stream()
+                                .anyMatch(delivery -> delivery.logicalRequest() == logicalRequest))
+                        .toList();
+                assertTrue(hasDistinctCapacityAssignment(requestTrips, capacities, 0, new boolean[capacities.length]),
+                        () -> filename + " has no distinct vehicle assignment for request " + logicalRequest);
+            }
         }
     }
 
@@ -223,15 +280,21 @@ public class MPVRPSeqVarTest extends CPSolverTest {
         return instance;
     }
 
-    private static int openPathDistance(MPVRPInstance instance, DepotProductNode depot,
-                                        List<Request> deliveries) {
-        int distance = 0;
-        int previous = depot.globalId();
-        for (Request delivery : deliveries) {
-            int station = delivery.station().globalId();
-            distance += instance.distMatrix[previous][station];
-            previous = station;
+    private static boolean hasDistinctCapacityAssignment(List<Trip> trips, int[] capacities,
+                                                         int trip, boolean[] usedVehicles) {
+        if (trip == trips.size()) {
+            return true;
         }
-        return distance;
+        for (int vehicle = 0; vehicle < capacities.length; vehicle++) {
+            if (!usedVehicles[vehicle] && trips.get(trip).quantity() <= capacities[vehicle]) {
+                usedVehicles[vehicle] = true;
+                if (hasDistinctCapacityAssignment(trips, capacities, trip + 1, usedVehicles)) {
+                    return true;
+                }
+                usedVehicles[vehicle] = false;
+            }
+        }
+        return false;
     }
+
 }

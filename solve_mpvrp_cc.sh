@@ -4,32 +4,53 @@
 # Undefined variables and pipeline failures are still treated as errors.
 set -uo pipefail
 
-readonly TIME_LIMIT_SECONDS=30
-readonly MAIN_CLASS="org.maxicp.cp.examples.raw.mpvrp.MPVRPSeqVar"
+if (( $# < 1 || $# > 2 )); then
+    echo "Usage: $0 {hybrid-opt|hybrid-nn|exact|opt|nn} [time-limit-seconds]" >&2
+    exit 1
+fi
 
-if (( $# != 1 )); then
-    echo "Usage: $0 {nn|opt}" >&2
+time_limit_seconds=${2:-30}
+if [[ ! "$time_limit_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: time limit must be a positive integer number of seconds." >&2
     exit 1
 fi
 
 case "$1" in
-    nn)
-        readonly ORDERING="nearest-neighbor"
+    nn|hybrid-nn)
+        mode="hybrid-nn"
+        main_class="org.maxicp.cp.examples.raw.mpvrp.MPVRPSeqVar"
+        ordering="nearest-neighbor"
+        solver_kind="hybrid"
         ;;
-    opt)
-        readonly ORDERING="2-opt"
+    opt|hybrid|hybrid-opt)
+        mode="hybrid-opt"
+        main_class="org.maxicp.cp.examples.raw.mpvrp.MPVRPSeqVar"
+        ordering="2-opt"
+        solver_kind="hybrid"
+        ;;
+    exact)
+        mode="exact"
+        main_class="org.maxicp.cp.examples.raw.mpvrp.MPVRP"
+        ordering=""
+        solver_kind="exact"
         ;;
     *)
-        echo "Error: unknown trip ordering '$1'. Expected 'nn' or 'opt'." >&2
-        echo "Usage: $0 {nn|opt}" >&2
+        echo "Error: unknown solver mode '$1'." >&2
+        echo "Usage: $0 {hybrid-opt|hybrid-nn|exact|opt|nn} [time-limit-seconds]" >&2
         exit 1
         ;;
 esac
 
+readonly TIME_LIMIT_SECONDS=$time_limit_seconds
+readonly MAIN_CLASS=$main_class
+readonly MODE=$mode
+readonly ORDERING=$ordering
+readonly SOLVER_KIND=$solver_kind
+
 # Resolve every path from the repository root, regardless of the current directory.
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 instance_dir="$script_dir/data/MPVRP_CC"
-solution_dir="$script_dir/sols_mpvrp_cc/$1"
+solution_dir="$script_dir/sols_mpvrp_cc/$MODE"
 class_dir="$script_dir/target/classes"
 
 # Check the commands required to compile and run the solver.
@@ -86,10 +107,14 @@ fi
 solved=0
 without_solution=0
 errors=0
+certified=0
 total=${#instances[@]}
 
 echo "$total instance(s) to solve, with ${TIME_LIMIT_SECONDS}s per instance."
-echo "Trip ordering: $ORDERING"
+echo "Solver mode: $MODE"
+if [[ "$SOLVER_KIND" == "hybrid" ]]; then
+    echo "Trip ordering: $ORDERING"
+fi
 echo "Solution directory: $solution_dir"
 
 for index in "${!instances[@]}"; do
@@ -98,30 +123,59 @@ for index in "${!instances[@]}"; do
     solution_name="Sol_${instance_name#MPVRP_}"
     final_solution="$solution_dir/$solution_name"
     temporary_solution="$temporary_dir/$solution_name"
+    temporary_log="$temporary_dir/${solution_name}.log"
 
     printf '\n[%d/%d] %s\n' "$((index + 1))" "$total" "$instance_name"
 
-    # TERM normally stops the JVM immediately. KILL is used five seconds later
-    # only as a safeguard if the process does not react to TERM.
-    timeout --signal=TERM --kill-after=5s "${TIME_LIMIT_SECONDS}s" \
-        java -cp "$class_dir" "$MAIN_CLASS" "$instance" "$temporary_solution" "$ORDERING"
-    exit_code=$?
+    if [[ "$SOLVER_KIND" == "exact" ]]; then
+        # MPVRP handles its limit internally so it can print whether the search
+        # completed. The external limit is only a five-second JVM safeguard.
+        watchdog_seconds=$((TIME_LIMIT_SECONDS + 5))
+        solver_command=(java -cp "$class_dir" "$MAIN_CLASS" \
+            "$instance" "$temporary_solution" "$TIME_LIMIT_SECONDS")
+    else
+        watchdog_seconds=$TIME_LIMIT_SECONDS
+        solver_command=(java -cp "$class_dir" "$MAIN_CLASS" \
+            "$instance" "$temporary_solution" "$ORDERING")
+    fi
+
+    timeout --signal=TERM --kill-after=5s "${watchdog_seconds}s" \
+        "${solver_command[@]}" 2>&1 | tee "$temporary_log"
+    exit_code=${PIPESTATUS[0]}
+
+    search_completed=false
+    if grep -Eq 'completed[[:space:]]*:[[:space:]]*true' "$temporary_log"; then
+        search_completed=true
+    fi
+    time_limit_reached=false
+    if (( exit_code == 124 || exit_code == 137 )) \
+            || grep -q 'Time limit reached' "$temporary_log"; then
+        time_limit_reached=true
+    fi
 
     # MPVRPSeqVar writes every improving solution immediately. Therefore, a
     # solution found before the timeout remains available after interruption.
     if [[ -s "$temporary_solution" ]]; then
         mv -f -- "$temporary_solution" "$final_solution"
         solved=$((solved + 1))
-        if (( exit_code == 124 || exit_code == 137 )); then
+        if [[ "$search_completed" == true ]]; then
+            certified=$((certified + 1))
+            if [[ "$SOLVER_KIND" == "exact" ]]; then
+                echo "Exact optimum certified and saved: $solution_name"
+            else
+                echo "Restricted trip-model optimum certified and saved: $solution_name"
+            fi
+        elif [[ "$time_limit_reached" == true ]]; then
             echo "Time limit reached; best solution found was saved: $solution_name"
-        elif (( exit_code == 0 )); then
-            echo "Search completed; solution saved: $solution_name"
         else
             echo "Search stopped with exit code $exit_code; solution found was saved: $solution_name"
         fi
     else
         without_solution=$((without_solution + 1))
-        if (( exit_code == 124 || exit_code == 137 )); then
+        if [[ "$search_completed" == true ]]; then
+            certified=$((certified + 1))
+            echo "Search completed without a feasible solution; infeasibility is certified for this model."
+        elif [[ "$time_limit_reached" == true ]]; then
             echo "Time limit reached without a solution; continuing with the next instance."
         else
             errors=$((errors + 1))
@@ -134,6 +188,7 @@ done
 printf '\nDone.\n'
 echo "Instances processed: $total"
 echo "Solutions produced: $solved"
+echo "Searches completed with an optimality/infeasibility certificate: $certified"
 echo "Instances without a new solution: $without_solution"
 echo "Failed executions: $errors"
 echo "Solution directory: $solution_dir"
