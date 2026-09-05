@@ -27,7 +27,6 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
@@ -59,27 +58,9 @@ public class MPVRPSeqVar {
     /** Delivery together with the vehicle slot used to construct a feasible packing witness. */
     private record AllocatedDelivery(Request request, int vehicle) {}
 
-    /** Heuristic used to order the deliveries inside each trip. */
-    public enum TripOrdering {
-        NEAREST_NEIGHBOR,
-        TWO_OPT;
-
-        static TripOrdering parse(String value) {
-            return switch (value.toLowerCase(Locale.ROOT).replace("_", "").replace("-", "")) {
-                case "nearest", "nearestneighbor", "nn" -> NEAREST_NEIGHBOR;
-                case "2opt", "twoopt" -> TWO_OPT;
-                default -> throw new IllegalArgumentException("Unknown trip ordering '" + value
-                        + "'. Expected nearest-neighbor or 2-opt.");
-            };
-        }
-    }
-
     public static void main(String[] args) throws Exception {
         String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_002_s3_d6_p3.dat";
         String outputFile = args.length > 1 ? args[1] : null;
-        TripOrdering tripOrdering = args.length > 2
-                ? TripOrdering.parse(args[2])
-                : TripOrdering.TWO_OPT;
 
         MPVRPInstance instance = MPVRPInstance.read(inputFile);
         int vehicleCount = instance.nVehicules;
@@ -91,7 +72,7 @@ public class MPVRPSeqVar {
         }
 
         // A trip starts at a depot and contains compatible deliveries that fit in one vehicle.
-        List<Trip> trips = buildTrips(instance, capacities, tripOrdering);
+        List<Trip> trips = buildTrips(instance, capacities);
         if (trips.isEmpty()) {
             System.out.println("No positive station demand in the instance.");
             return;
@@ -246,7 +227,6 @@ public class MPVRPSeqVar {
         });
 
         System.out.println("Starting search...");
-        System.out.println("Trip ordering: " + tripOrdering);
         SearchStatistics statistics = search.optimize(objective);
 
         System.out.println(statistics);
@@ -260,18 +240,6 @@ public class MPVRPSeqVar {
      * @return trips to assign to the vehicle routes
      */
     static List<Trip> buildTrips(MPVRPInstance instance, int[] capacities) {
-        return buildTrips(instance, capacities, TripOrdering.TWO_OPT);
-    }
-
-    /**
-     * Splits station demands into deliveries and groups compatible deliveries into trips.
-     *
-     * @param instance problem instance containing stocks and station demands
-     * @param capacities capacity of each available vehicle
-     * @param tripOrdering heuristic used to order deliveries within each trip
-     * @return trips to assign to the vehicle routes
-     */
-    static List<Trip> buildTrips(MPVRPInstance instance, int[] capacities, TripOrdering tripOrdering) {
         if (capacities.length == 0 || Arrays.stream(capacities).anyMatch(capacity -> capacity <= 0)) {
             throw new IllegalArgumentException("Vehicle capacities must be positive");
         }
@@ -286,9 +254,7 @@ public class MPVRPSeqVar {
         List<AllocatedDelivery> deliveries = allocateDeliveries(instance, capacities, vehicleOrder,
                 requestOrder, AllocationStrategy.MAX_QUANTITY);
         if (deliveries == null) {
-            // The quantity-maximizing rule can fragment the remaining depot stocks
-            // even when a feasible allocation exists. Retry while preserving large
-            // stocks for later requests.
+            // retry while preserving large requests
             deliveries = allocateDeliveries(instance, capacities, vehicleOrder,
                     requestOrder, AllocationStrategy.PRESERVE_LARGE_STOCKS);
         }
@@ -301,9 +267,7 @@ public class MPVRPSeqVar {
                 .reversed());
         List<TripBin> bins = new ArrayList<>();
 
-        // Pack only deliveries sharing the same construction vehicle. This retains
-        // heterogeneous capacities and provides a feasible assignment witness for
-        // all split-delivery distinct-vehicle constraints.
+        // Pack only deliveries sharing the same construction vehicle.
         for (AllocatedDelivery allocated : deliveries) {
             Request delivery = allocated.request();
             int constructionVehicle = allocated.vehicle();
@@ -325,13 +289,10 @@ public class MPVRPSeqVar {
             selectedBin.add(delivery);
         }
 
-        // Order the deliveries inside each trip with the selected construction heuristic.
+        // Start with nearest neighbors, then improve the order with 2-opt.
         List<Trip> trips = new ArrayList<>(bins.size());
         for (TripBin bin : bins) {
-            List<Request> orderedDeliveries = switch (tripOrdering) {
-                case NEAREST_NEIGHBOR -> orderByNearestStation(instance, bin.depot, bin.deliveries);
-                case TWO_OPT -> orderBy2Opt(instance, bin.depot, bin.deliveries);
-            };
+            List<Request> orderedDeliveries = orderBy2Opt(instance, bin.depot, bin.deliveries);
             trips.add(new Trip(bin.depot, orderedDeliveries));
         }
         return trips;
