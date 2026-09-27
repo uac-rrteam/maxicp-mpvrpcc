@@ -4,32 +4,18 @@
 # Undefined variables and pipeline failures are still treated as errors.
 set -uo pipefail
 
-readonly TIME_LIMIT_SECONDS=30
+readonly TIME_LIMIT_SECONDS=20
 readonly MAIN_CLASS="org.maxicp.cp.examples.raw.mpvrp.MPVRPSeqVar"
 
-if (( $# != 1 )); then
-    echo "Usage: $0 {nn|opt}" >&2
+if (( $# != 0 )); then
+    echo "Usage: $0" >&2
     exit 1
 fi
 
-case "$1" in
-    nn)
-        readonly ORDERING="nearest-neighbor"
-        ;;
-    opt)
-        readonly ORDERING="2-opt"
-        ;;
-    *)
-        echo "Error: unknown trip ordering '$1'. Expected 'nn' or 'opt'." >&2
-        echo "Usage: $0 {nn|opt}" >&2
-        exit 1
-        ;;
-esac
-
 # Resolve every path from the repository root, regardless of the current directory.
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-instance_dir="$script_dir/data/MPVRP_CC"
-solution_dir="$script_dir/sols_mpvrp_cc/$1"
+instance_dir="$script_dir/instances_out"
+solution_dir="$script_dir/sols_mpvrp_cc/out"
 class_dir="$script_dir/target/classes"
 
 # Check the commands required to compile and run the solver.
@@ -89,7 +75,6 @@ errors=0
 total=${#instances[@]}
 
 echo "$total instance(s) to solve, with ${TIME_LIMIT_SECONDS}s per instance."
-echo "Trip ordering: $ORDERING"
 echo "Solution directory: $solution_dir"
 
 for index in "${!instances[@]}"; do
@@ -104,7 +89,7 @@ for index in "${!instances[@]}"; do
     # TERM normally stops the JVM immediately. KILL is used five seconds later
     # only as a safeguard if the process does not react to TERM.
     timeout --signal=TERM --kill-after=5s "${TIME_LIMIT_SECONDS}s" \
-        java -cp "$class_dir" "$MAIN_CLASS" "$instance" "$temporary_solution" "$ORDERING"
+        java -cp "$class_dir" "$MAIN_CLASS" "$instance" "$temporary_solution"
     exit_code=$?
 
     # MPVRPSeqVar writes every improving solution immediately. Therefore, a

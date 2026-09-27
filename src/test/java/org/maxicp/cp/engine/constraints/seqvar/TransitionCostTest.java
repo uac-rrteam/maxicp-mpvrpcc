@@ -22,7 +22,7 @@ import static org.maxicp.cp.CPFactory.makeSeqVar;
 
 public class TransitionCostTest extends CPSolverTest {
 
-    private static final int PENALTY_INF = 1_000_000;
+    private static final int PENALTY_INF = Integer.MAX_VALUE;
 
     @ParameterizedTest
     @MethodSource("getSolver")
@@ -106,7 +106,7 @@ public class TransitionCostTest extends CPSolverTest {
     @MethodSource("getSolver")
     public void testPenaltyOnUsedTransitionIsInconsistent(CPSolver cp) {
         CPSeqVar seqVar = makeSeqVar(cp, 2, 0, 1);
-        CPIntVar total = makeIntVar(cp, 0, PENALTY_INF);
+        CPIntVar total = makeIntVar(cp, 0, PENALTY_INF - 1);
         int[][] costs = {
                 {0, PENALTY_INF},
                 {0, 0}
@@ -132,6 +132,22 @@ public class TransitionCostTest extends CPSolverTest {
 
         assertEquals(12, total.min());
         assertEquals(12, total.max());
+    }
+
+    @ParameterizedTest
+    @MethodSource("getSolver")
+    public void testMillionIsAValidFiniteCost(CPSolver cp) {
+        CPSeqVar seqVar = makeSeqVar(cp, 2, 0, 1);
+        CPIntVar total = makeIntVar(cp, 0, 1_000_000);
+        int[][] costs = {
+                {0, 1_000_000},
+                {0, 0}
+        };
+
+        cp.post(new TransitionCost(seqVar, costs, total));
+
+        assertEquals(1_000_000, total.min());
+        assertEquals(1_000_000, total.max());
     }
 
     @ParameterizedTest

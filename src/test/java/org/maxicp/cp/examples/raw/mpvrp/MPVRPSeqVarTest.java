@@ -77,7 +77,7 @@ public class MPVRPSeqVarTest extends CPSolverTest {
     }
 
     @Test
-    public void testTwoOptImprovesNearestNeighborOpenPath() {
+    public void testDeliveriesAreOrderedByNearestNeighborAndTwoOpt() {
         int[][] coordinates = {
                 {0, 0},  // depot
                 {0, 0},  // garage
@@ -106,13 +106,10 @@ public class MPVRPSeqVarTest extends CPSolverTest {
         List<Request> deliveries = java.util.stream.IntStream.range(0, requests.length)
                 .mapToObj(i -> new Request(i, requests[i], depot, 1))
                 .toList();
-        List<Request> nearest = MPVRPSeqVar.orderByNearestStation(instance, depot, deliveries);
-        List<Request> twoOpt = MPVRPSeqVar.orderBy2Opt(instance, depot, deliveries);
+        List<Request> ordered = MPVRPSeqVar.orderDeliveries(instance, depot, deliveries);
 
-        assertEquals(new HashSet<>(deliveries), new HashSet<>(twoOpt));
-        assertTrue(openPathDistance(instance, depot, twoOpt) < openPathDistance(instance, depot, nearest));
-        assertEquals(30, openPathDistance(instance, depot, nearest));
-        assertEquals(25, openPathDistance(instance, depot, twoOpt));
+        assertEquals(new HashSet<>(deliveries), new HashSet<>(ordered));
+        assertEquals(25, openPathDistance(instance, depot, ordered));
     }
 
     @Test

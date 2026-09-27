@@ -27,7 +27,6 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
@@ -49,29 +48,11 @@ import static org.maxicp.search.Searches.*;
 public class MPVRPSeqVar {
 
     /** Cost assigned to transitions that are not allowed. */
-    private static final int PENALTY_INF = 1_000_000;
-
-    /** Heuristic used to order the deliveries inside each trip. */
-    public enum TripOrdering {
-        NEAREST_NEIGHBOR,
-        TWO_OPT;
-
-        static TripOrdering parse(String value) {
-            return switch (value.toLowerCase(Locale.ROOT).replace("_", "").replace("-", "")) {
-                case "nearest", "nearestneighbor", "nn" -> NEAREST_NEIGHBOR;
-                case "2opt", "twoopt" -> TWO_OPT;
-                default -> throw new IllegalArgumentException("Unknown trip ordering '" + value
-                        + "'. Expected nearest-neighbor or 2-opt.");
-            };
-        }
-    }
+    private static final int PENALTY_INF = Integer.MAX_VALUE;
 
     public static void main(String[] args) throws Exception {
         String inputFile = args.length > 0 ? args[0] : "data/MPVRP_CC/MPVRP_073_s5_d6_p3.dat";
         String outputFile = args.length > 1 ? args[1] : null;
-        TripOrdering tripOrdering = args.length > 2
-                ? TripOrdering.parse(args[2])
-                : TripOrdering.NEAREST_NEIGHBOR;
 
         MPVRPInstance instance = MPVRPInstance.read(inputFile);
         int vehicleCount = instance.nVehicules;
@@ -83,7 +64,7 @@ public class MPVRPSeqVar {
         }
 
         // A trip starts at a depot and contains compatible deliveries that fit in one vehicle.
-        List<Trip> trips = buildTrips(instance, capacities, tripOrdering);
+        List<Trip> trips = buildTrips(instance, capacities);
         if (trips.isEmpty()) {
             System.out.println("No positive station demand in the instance.");
             return;
@@ -95,7 +76,7 @@ public class MPVRPSeqVar {
         int[][] cost = buildTripCosts(instance, trips, initialProducts, vehicleCount);
         int maxArc = Arrays.stream(cost).flatMapToInt(Arrays::stream)
                 .filter(value -> value != PENALTY_INF).max().orElse(0);
-        int maxRouteCost = (int) Math.min(Integer.MAX_VALUE, (long) maxArc * nodeCount);
+        int maxRouteCost = (int) Math.min(Integer.MAX_VALUE - 1L, (long) maxArc * nodeCount);
 
         // ===================== variables =====================
 
@@ -238,7 +219,6 @@ public class MPVRPSeqVar {
         });
 
         System.out.println("Starting search...");
-        System.out.println("Trip ordering: " + tripOrdering);
         SearchStatistics statistics = search.optimize(objective);
 
         System.out.println(statistics);
@@ -252,18 +232,6 @@ public class MPVRPSeqVar {
      * @return trips to assign to the vehicle routes
      */
     static List<Trip> buildTrips(MPVRPInstance instance, int[] capacities) {
-        return buildTrips(instance, capacities, TripOrdering.TWO_OPT);
-    }
-
-    /**
-     * Splits station demands into deliveries and groups compatible deliveries into trips.
-     *
-     * @param instance problem instance containing stocks and station demands
-     * @param capacities capacity of each available vehicle
-     * @param tripOrdering heuristic used to order deliveries within each trip
-     * @return trips to assign to the vehicle routes
-     */
-    static List<Trip> buildTrips(MPVRPInstance instance, int[] capacities, TripOrdering tripOrdering) {
         if (capacities.length == 0 || Arrays.stream(capacities).anyMatch(capacity -> capacity <= 0)) {
             throw new IllegalArgumentException("Vehicle capacities must be positive");
         }
@@ -340,29 +308,28 @@ public class MPVRPSeqVar {
             selectedBin.add(delivery);
         }
 
-        // Order the deliveries inside each trip with the selected construction heuristic.
+        // Order the deliveries inside each trip with nearest-neighbor followed by 2-opt.
         List<Trip> trips = new ArrayList<>(bins.size());
         for (TripBin bin : bins) {
-            List<Request> orderedDeliveries = switch (tripOrdering) {
-                case NEAREST_NEIGHBOR -> orderByNearestStation(instance, bin.depot, bin.deliveries);
-                case TWO_OPT -> orderBy2Opt(instance, bin.depot, bin.deliveries);
-            };
+            List<Request> orderedDeliveries = orderDeliveries(instance, bin.depot, bin.deliveries);
             trips.add(new Trip(bin.depot, orderedDeliveries));
         }
         return trips;
     }
 
     /**
-     * Orders a trip's deliveries with a nearest-neighbor heuristic.
+     * Orders a trip's deliveries with nearest-neighbor and improves that ordering with 2-opt.
+     * The depot remains the fixed start of the open path; the final station is free to change.
+     * Full path lengths are evaluated, so this also works for asymmetric distance matrices.
      *
      * @param instance problem instance providing the distance matrix
      * @param depot starting depot of the trip
      * @param deliveries deliveries to order
-     * @return a new list ordered from the depot to the nearest remaining station
+     * @return a nearest-neighbor ordering improved to a 2-opt local optimum
      */
-    static List<Request> orderByNearestStation(MPVRPInstance instance,
-                                               MPVRPInstance.DepotProductNode depot,
-                                               List<Request> deliveries) {
+    static List<Request> orderDeliveries(MPVRPInstance instance,
+                                         MPVRPInstance.DepotProductNode depot,
+                                         List<Request> deliveries) {
         List<Request> remaining = new ArrayList<>(deliveries);
         List<Request> ordered = new ArrayList<>(deliveries.size());
         int currentGlobalId = depot.globalId();
@@ -380,23 +347,6 @@ public class MPVRPSeqVar {
             ordered.add(delivery);
             currentGlobalId = delivery.station().globalId();
         }
-        return ordered;
-    }
-
-    /**
-     * Improves the nearest-neighbor ordering by reversing station subsequences.
-     * The depot remains the fixed start of the open path; the final station is free to change.
-     * Full path lengths are evaluated, so this also works for asymmetric distance matrices.
-     *
-     * @param instance problem instance providing the distance matrix
-     * @param depot starting depot of the trip
-     * @param deliveries deliveries to order
-     * @return a nearest-neighbor ordering improved to a 2-opt local optimum
-     */
-    static List<Request> orderBy2Opt(MPVRPInstance instance,
-                                     MPVRPInstance.DepotProductNode depot,
-                                     List<Request> deliveries) {
-        List<Request> ordered = orderByNearestStation(instance, depot, deliveries);
         long currentDistance = tripDistance(instance, depot, ordered);
 
         boolean improved;

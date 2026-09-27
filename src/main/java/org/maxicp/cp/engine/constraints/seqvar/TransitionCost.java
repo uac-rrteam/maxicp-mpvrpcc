@@ -15,7 +15,7 @@ public class TransitionCost extends AbstractCPConstraint {
     private final int[] nodes;
     private final int[][] costs;
     private final CPIntVar total;
-    private static final int PENALTY_INF = 1_000_000;
+    private static final int PENALTY_INF = Integer.MAX_VALUE;
 
     /**
      * compute the total cost of a sequence of nodes given a cost matrix
@@ -50,7 +50,7 @@ public class TransitionCost extends AbstractCPConstraint {
         int value = 0;
         for (int i = 0; i < n -1; i++){
             int moveCost = costs[nodes[i]][nodes[i+1]];
-            if (moveCost >= PENALTY_INF){
+            if (moveCost == PENALTY_INF){
                 throw InconsistencyException.INCONSISTENCY;
             }
             value += moveCost;
